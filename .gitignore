@@ -21,3 +21,10 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .idea/
+
+# Música de fondo con licencia propia (solo se versionan el README y los .gitkeep de assets/music/)
+assets/music/**/*.mp3
+assets/music/**/*.m4a
+assets/music/**/*.wav
+assets/music/**/*.ogg
+assets/music/**/*.flac

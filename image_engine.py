@@ -1,19 +1,23 @@
 """Image generation engine supporting Fal.ai Flux/schnell and Mock mode (Módulo 3)."""
 
 import asyncio
+import math
 import os
 import random
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from rich.console import Console
 
 import fal_client
 from config import (
     FAL_KEY,
+    FLUX_COST_USD,
+    FLUX_IMAGE_SIZE,
+    FLUX_IMAGE_SIZE_LEGACY,
     VIDEO_WIDTH,
     VIDEO_HEIGHT,
     FONTS_DIR,
@@ -21,14 +25,13 @@ from config import (
 )
 from pipeline_utils import CacheManifest, PipelineError, RunStats, fingerprint
 from script_engine import SceneSchema, VideoProjectSchema
+from styles import COMPOSITION_SUFFIX, get_style
 
 console = Console()
 
 # Parámetros de generación (forman parte de la huella de cada imagen)
 FLUX_MODEL = "fal-ai/flux/schnell"
-FLUX_IMAGE_SIZE = "portrait_16_9"
 FLUX_STEPS = 4
-FLUX_COST_USD = 0.003  # costo estimado por imagen
 MIN_IMAGE_BYTES = 5000
 
 
@@ -116,8 +119,9 @@ def create_mock_scene_image(
     return output_path
 
 
-def compose_scene_prompt(scene: SceneSchema, project: VideoProjectSchema) -> str:
-    """Build the final composite prompt injecting character consistency."""
+def compose_scene_prompt_legacy(scene: SceneSchema, project: VideoProjectSchema) -> str:
+    """Composición ANTERIOR (guiones sin visual_style_id). NO MODIFICAR: su salida forma parte de la huella de las
+    imágenes ya pagadas; cambiar un solo byte obliga a volver a pagarlas todas."""
     parts = [project.global_visual_style.strip()]
 
     # Inject character physical descriptions if characters present in this scene
@@ -133,6 +137,105 @@ def compose_scene_prompt(scene: SceneSchema, project: VideoProjectSchema) -> str
     parts.append("vertical 9:16 composition, vibrant details, high resolution, no text, no watermarks, cinematic lighting")
 
     return ". ".join(parts)
+
+
+# Flux schnell: el codificador T5 trunca a ~256 tokens. Estimación barata sin tokenizador: ceil(palabras x 1.35).
+PROMPT_TOKEN_LIMIT = 230
+TOKENS_PER_WORD = 1.35
+CHAR_DESC_WORD_LIMITS = (25, 12)  # recortes progresivos de cada descripción de personaje
+MIN_VISUAL_PROMPT_WORDS = 15  # último recurso: el prompt de la escena nunca baja de esto
+_warned_long_prompts: set[tuple[int, str]] = set()
+
+
+def estimate_prompt_tokens(text: str) -> int:
+    """Tokens T5 estimados: ceil(palabras x 1.35)."""
+    return math.ceil(len(text.split()) * TOKENS_PER_WORD)
+
+
+def _sentence(text: str) -> str:
+    """Texto sin espacios sobrantes y terminado en puntuación de oración (sin duplicar puntos)."""
+    t = text.strip()
+    if t and t[-1] not in ".!?…":
+        t += "."
+    return t
+
+
+def _truncate_words(text: str, max_words: int) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words]).rstrip(" ,;:-")
+
+
+def _join_style_prompt(visual: str, char_descs: list[str], style_suffix: str) -> str:
+    parts = [_sentence(visual)]
+    if char_descs:
+        parts.append(_sentence("Featuring: " + "; ".join(d.strip().rstrip(" .") for d in char_descs)))
+    parts.append(_sentence(style_suffix))
+    parts.append(_sentence(COMPOSITION_SUFFIX))
+    return " ".join(p for p in parts if p)
+
+
+def compose_scene_prompt(scene: SceneSchema, project: VideoProjectSchema) -> str:
+    """Prompt final de la imagen de una escena.
+
+    Con project.visual_style_id: sujeto -> personajes -> estilo -> composición (lo primero pesa más en Flux).
+    Sin él (guion legado): compose_scene_prompt_legacy, byte a byte igual que antes. Si el prompt nuevo supera
+    PROMPT_TOKEN_LIMIT tokens estimados, avisa y recorta primero las descripciones de personajes; el estilo y el
+    sufijo de composición nunca se eliminan.
+    """
+    if not project.visual_style_id:
+        return compose_scene_prompt_legacy(scene, project)
+    try:
+        style = get_style(project.visual_style_id)
+    except ValueError as e:
+        raise PipelineError(f"script.json: {e}") from e
+
+    visual = scene.visual_prompt_en.strip()
+    char_descs: list[str] = []
+    if scene.characters_in_scene and project.characters:
+        for char_id in scene.characters_in_scene:
+            if char_id in project.characters:
+                char_descs.append(project.characters[char_id].strip())
+
+    prompt = _join_style_prompt(visual, char_descs, style.image_suffix)
+    full_tokens = estimate_prompt_tokens(prompt)
+    if full_tokens <= PROMPT_TOKEN_LIMIT:
+        return prompt
+
+    action = None
+    trimmed = char_descs
+    for limit in CHAR_DESC_WORD_LIMITS if char_descs else ():
+        trimmed = [_truncate_words(d.rstrip(" ."), limit) for d in char_descs]
+        prompt = _join_style_prompt(visual, trimmed, style.image_suffix)
+        if estimate_prompt_tokens(prompt) <= PROMPT_TOKEN_LIMIT:
+            action = f"descripciones de personajes recortadas a {limit} palabras"
+            break
+    if action is None:
+        # Último recurso: acortar el propio prompt visual (palabra a palabra, con un mínimo)
+        words = visual.split()
+        while len(words) > MIN_VISUAL_PROMPT_WORDS:
+            words.pop()
+            prompt = _join_style_prompt(" ".join(words).rstrip(" ,;:-"), trimmed, style.image_suffix)
+            if estimate_prompt_tokens(prompt) <= PROMPT_TOKEN_LIMIT:
+                break
+        action = "prompt visual de la escena acortado" + (" y personajes recortados" if char_descs else "")
+
+    key = (scene.scene_id, prompt)
+    if key not in _warned_long_prompts:
+        _warned_long_prompts.add(key)
+        console.print(
+            f"  [yellow]⚠ Escena {scene.scene_id:02d}: el prompt compuesto tiene ~{full_tokens} tokens "
+            f"(límite {PROMPT_TOKEN_LIMIT}; Flux trunca a ~256); {action} -> ~{estimate_prompt_tokens(prompt)} tokens.[/yellow]"
+        )
+    return prompt
+
+
+def fit_cover(im: Image.Image, width: int, height: int) -> Image.Image:
+    """Escala la imagen para CUBRIR width x height (sin deformarla) y recorta el sobrante centrado (LANCZOS)."""
+    if im.size == (width, height):
+        return im
+    return ImageOps.fit(im, (width, height), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
 
 async def generate_single_flux_image(
@@ -197,10 +300,7 @@ async def generate_single_flux_image(
             part_path = output_path.with_name(output_path.stem + ".part.png")
             try:
                 with Image.open(temp_path) as im:
-                    rgb_im = im.convert("RGB")
-                    if rgb_im.size != (VIDEO_WIDTH, VIDEO_HEIGHT):
-                        rgb_im = rgb_im.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-                    rgb_im.save(part_path, "PNG")
+                    fit_cover(im.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT).save(part_path, "PNG")
                 os.replace(part_path, output_path)
             finally:
                 for leftover in (temp_path, part_path):
@@ -222,16 +322,33 @@ async def generate_single_flux_image(
     raise PipelineError(f"{output_path.name}: {last_error}")
 
 
-def image_fingerprint(prompt: str, mock_images: bool) -> str:
+def image_fingerprint(prompt: str, mock_images: bool, image_size: Any = None) -> str:
     """Huella de una imagen: prompt final compuesto + modo mock + modelo + tamaño + pasos."""
     return fingerprint(
         kind="image",
         prompt=prompt,
         mock_images=mock_images,
         model=FLUX_MODEL,
-        image_size=FLUX_IMAGE_SIZE,
+        image_size=FLUX_IMAGE_SIZE if image_size is None else image_size,
         steps=FLUX_STEPS,
     )
+
+
+def legacy_image_fingerprint(prompt: str) -> str:
+    """Huella que tenían las imágenes reales (pagadas) con el tamaño anterior 'portrait_16_9' (576x1024)."""
+    return image_fingerprint(prompt, False, image_size=FLUX_IMAGE_SIZE_LEGACY)
+
+
+def classify_recorded_image(recorded_fp: Optional[str], prompt: str) -> Optional[str]:
+    """'current' si la huella registrada es la de una imagen real con los parámetros actuales; 'legacy' si es la de una
+    imagen real con el tamaño anterior (se acepta en caché para no volver a pagarla); None en otro caso (mock u obsoleta)."""
+    if recorded_fp is None:
+        return None
+    if recorded_fp == image_fingerprint(prompt, False):
+        return "current"
+    if recorded_fp == legacy_image_fingerprint(prompt):
+        return "legacy"
+    return None
 
 
 async def generate_all_images(
@@ -268,13 +385,13 @@ async def generate_all_images(
         reroll = scene.scene_id in overrides.scene_ids
         forced = force or reroll
 
-        # Imagen real (pagada) vigente: su huella registrada coincide con la huella en modo real
-        has_paid_image = (
-            mock_images
-            and image_path.exists()
-            and image_path.stat().st_size > MIN_IMAGE_BYTES
-            and manifest.get(image_path) == image_fingerprint(final_prompt, False)
+        # Imagen real (pagada) vigente: su huella registrada coincide con la huella en modo real (tamaño actual o legado)
+        recorded_kind = (
+            classify_recorded_image(manifest.get(image_path), final_prompt)
+            if image_path.exists() and image_path.stat().st_size > MIN_IMAGE_BYTES
+            else None
         )
+        has_paid_image = mock_images and recorded_kind is not None
 
         is_cached = False
         if has_paid_image and not forced:
@@ -287,6 +404,13 @@ async def generate_all_images(
         if not forced and not has_paid_image:
             if manifest.has(image_path):
                 is_cached = manifest.is_fresh(image_path, fp) and image_path.stat().st_size > MIN_IMAGE_BYTES
+                if not is_cached and recorded_kind == "legacy":
+                    # Legado: imagen real pagada a 576x1024 (portrait_16_9). Se acepta; solo un force/re-roll la rehace.
+                    is_cached = True
+                    console.print(
+                        f"  [dim]Escena {scene.scene_id:02d}: imagen real de tamaño anterior (portrait_16_9) aceptada "
+                        f"en caché; usa --force-images o retry-scene para rehacerla a {FLUX_IMAGE_SIZE['width']}x{FLUX_IMAGE_SIZE['height']}[/dim]"
+                    )
             elif image_path.exists():
                 # Migración: imagen de un workspace de Fase 1 sin entrada en el manifiesto
                 if legacy_marker.exists():

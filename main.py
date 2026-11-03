@@ -3,6 +3,7 @@
 Comandos:
   generate      Genera un video completo (caché por huella de contenido por escena).
   retry-scene   Regenera escenas concretas (imagen y/o narración) y reensambla el video.
+  styles        Lista los estilos visuales disponibles (opción --style de generate).
 """
 
 import json
@@ -29,12 +30,14 @@ from script_engine import (
     VideoProjectSchema,
     generate_or_load_script,
     light_normalize_project,
+    resolve_style_id,
     write_script,
 )
+from styles import STYLES
 from tts_engine import generate_tts_sync
 from image_engine import FLUX_COST_USD, ImageOverrides, generate_images_sync
 from subtitle_engine import generate_subtitles_ass
-from audio_engine import mix_audio
+from audio_engine import mix_audio, select_library_track
 from video_engine import render_all_scene_clips, assemble_final_video
 
 for _stream in (sys.stdout, sys.stderr):
@@ -47,7 +50,8 @@ app = typer.Typer(
     name="short-video-gen",
     help=(
         "CLI profesional para automatizar la creación de videos verticales (Shorts/Reels/TikTok en 9:16).\n\n"
-        "Comandos: 'generate' crea un video completo; 'retry-scene' regenera escenas concretas de un proyecto existente."
+        "Comandos: 'generate' crea un video completo; 'retry-scene' regenera escenas concretas de un proyecto existente; "
+        "'styles' lista los estilos visuales."
     ),
     add_completion=False,
     no_args_is_help=True,
@@ -81,9 +85,11 @@ class RunConfig:
     topic: str
     profile: str
     voice: Optional[str] = None
-    music: Optional[str] = None
+    music: Optional[str] = None  # ruta de la pista usada (--music o elegida de assets/music/); None = sin elegir/drone
+    music_source: Optional[str] = None  # "explicit" (--music) | "library" (assets/music/ por hash del slug)
     mock_script: bool = False
     mock_images: bool = False
+    style: str = ""  # estilo visual resuelto (styles.STYLES); "" = guion legado sin estilo
 
     def save(self, workspace: Path) -> None:
         (workspace / RUN_CONFIG_FILENAME).write_text(
@@ -100,8 +106,10 @@ class RunConfig:
                 profile=str(data["profile"]),
                 voice=data.get("voice") or None,
                 music=data.get("music") or None,
+                music_source=data.get("music_source") or ("explicit" if data.get("music") else None),
                 mock_script=bool(data.get("mock_script", False)),
                 mock_images=bool(data.get("mock_images", False)),
+                style=str(data.get("style") or ""),
             )
         except (OSError, ValueError, KeyError, TypeError) as e:
             raise PipelineError(f"{RUN_CONFIG_FILENAME} es inválido o está incompleto ({e}). Ejecuta 'generate' de nuevo para recrearlo.") from e
@@ -133,6 +141,35 @@ class PipelineResult:
     stats: RunStats = field(default_factory=RunStats)
 
 
+def resolve_music(workspace: Path, config: RunConfig, profile_name: str, env_status: dict[str, str]) -> Path:
+    """Pista de fondo: --music > pista ya registrada en run_config.json > biblioteca assets/music/ > drone sintético.
+
+    La elección de la biblioteca es determinista (hash del slug) y se guarda en run_config.json para que las
+    ejecuciones posteriores y retry-scene usen exactamente la misma pista (la caché de la mezcla sigue válida).
+    """
+    if config.music:
+        recorded = Path(config.music)
+        if recorded.is_file():
+            return recorded
+        if config.music_source == "explicit":
+            raise PipelineError(f"El archivo de música indicado en --music ya no existe: {recorded}")
+        console.print(f"[yellow]Aviso: la pista de música registrada ya no existe ({recorded}); se elegirá otra.[/yellow]")
+        config.music = config.music_source = None
+
+    track = select_library_track(workspace.name, profile_name)
+    if track is not None:
+        config.music, config.music_source = str(track.resolve()), "library"
+        config.save(workspace)
+        console.print(f"[green]✓ Música de la biblioteca:[/] {track.name} [dim](elegida por hash del slug; guardada en run_config.json)[/dim]")
+        return track
+
+    console.print(
+        "[yellow]⚠ Sin música en assets/music/: el video no tendrá música de fondo real "
+        "(se usa el drone sintético incluido).[/yellow]"
+    )
+    return Path(env_status["bgm"])
+
+
 def run_pipeline(
     workspace: Path,
     config: RunConfig,
@@ -155,7 +192,12 @@ def run_pipeline(
         force=force.script,
         mock_script=config.mock_script,
         stats=stats,
+        style_id=config.style,
     )
+    if config.style != project.visual_style_id:
+        # El estilo real es el del guion (p. ej. recién generado con el default del perfil)
+        config.style = project.visual_style_id
+        config.save(workspace)
 
     # Módulo 2: Voice & Timing Engine
     console.rule("[bold cyan]Módulo 2: Motor de Voz y Tiempos al Milisegundo[/bold cyan]")
@@ -184,7 +226,7 @@ def run_pipeline(
     # Módulo 4: Subtitle Engine
     console.rule("[bold cyan]Módulo 4: Subtítulos Dinámicos Virales (.ass)[/bold cyan]")
     ass_path = workspace / "subtitles.ass"
-    generate_subtitles_ass(timing_metadata=timing_metadata, output_ass_path=ass_path)
+    generate_subtitles_ass(timing_metadata=timing_metadata, output_ass_path=ass_path, hook_text=project.hook_text)
 
     # Módulo 5: Video Engine
     console.rule("[bold cyan]Módulo 5: Ensamblado y Renderizado FFmpeg[/bold cyan]")
@@ -197,7 +239,7 @@ def run_pipeline(
         stats=stats,
     )
 
-    bgm_file = Path(config.music) if config.music else Path(env_status["bgm"])
+    bgm_file = resolve_music(workspace, config, profile.name, env_status)
     whoosh_file = Path(env_status["whoosh"])
     final_video_path = workspace / "final_video.mp4"
 
@@ -321,7 +363,15 @@ def generate(
     music: Optional[Path] = typer.Option(
         None,
         "--music",
-        help="Ruta personalizada a un archivo de música de fondo (.mp3).",
+        help="Ruta a una pista de música de fondo (.mp3/.m4a/.wav). Sin esta opción se elige una de assets/music/.",
+    ),
+    style: Optional[str] = typer.Option(
+        None,
+        "--style",
+        help=(
+            f"Estilo visual: {', '.join(STYLES)}. Por defecto: el del guion en caché, o el del perfil si es nuevo "
+            "(ver 'python main.py styles'). Cambiarlo en un video existente regenera todas sus imágenes."
+        ),
     ),
 ):
     """Genera un video vertical completo con edición dinámica, SFX, BGM y subtítulos animados."""
@@ -352,12 +402,20 @@ def generate(
         console.print(f"[bold red]Error:[/] el archivo de música indicado en --music no existe: {music}")
         raise typer.Exit(code=1)
 
+    # Estilo visual: --style > guion en caché > default del perfil (se valida antes de tocar nada)
+    target_slug = slug if slug else slugify(topic)
+    try:
+        style_id = resolve_style_id(style, WORKSPACE_DIR / target_slug / "script.json", prof_obj)
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/] {escape(str(e))}")
+        raise typer.Exit(code=1)
+    console.print(f"[cyan]Estilo visual:[/] {style_id or 'legado (guion sin estilo; se conserva su prompt anterior)'}")
+
     # 3. Environment & Assets Check (Fase 0)
     env_status = _check_environment()
 
     try:
         # 4. Prepare Workspace + run_config.json
-        target_slug = slug if slug else slugify(topic)
         project_workspace = WORKSPACE_DIR / target_slug
         project_workspace.mkdir(parents=True, exist_ok=True)
         console.print(f"[cyan]Workspace activo:[/] {project_workspace}")
@@ -367,8 +425,10 @@ def generate(
             profile=prof_obj.name,
             voice=voice,
             music=str(music.resolve()) if music else None,
+            music_source="explicit" if music else None,
             mock_script=mock_script,
             mock_images=mock_images,
+            style=style_id,
         )
         config.save(project_workspace)
 
@@ -387,6 +447,7 @@ def generate(
 
     table.add_row("Título", result.project.title)
     table.add_row("Perfil", prof_obj.name)
+    table.add_row("Estilo visual", result.project.visual_style_id or "legado (sin estilo)")
     table.add_row("Escenas", str(len(result.project.scenes)))
     table.add_row("Duración Total", f"{result.timing_metadata.get('total_duration_sec', 0):.2f} segundos ({result.timing_metadata.get('total_frames', 0)} fotogramas)")
     table.add_row("Regenerado", _stats_line(result.stats))
@@ -477,6 +538,7 @@ def retry_scene(
         except Exception as e:
             raise PipelineError(f"script.json de '{slug}' no es válido: {e}") from e
         light_normalize_project(project, get_profile(config.profile))  # ids 1..N, igual que el pipeline
+        config.style = project.visual_style_id  # retry-scene siempre usa el estilo del guion
         existing_ids = [sc.scene_id for sc in project.scenes]
         missing = [i for i in scene_ids if i not in existing_ids]
         if missing:
@@ -550,13 +612,31 @@ def retry_scene(
     console.print("\n[bold green]✓ Escena(s) regenerada(s) y video final actualizado.[/bold green]\n")
 
 
+# --------------------------------------------------------------------------- #
+# Comando: styles
+# --------------------------------------------------------------------------- #
+
+@app.command("styles")
+def list_styles():
+    """Lista los estilos visuales disponibles para --style y los perfiles que los usan por defecto."""
+    table = Table(title="Estilos visuales (usa: generate --style <id>)", border_style="cyan")
+    table.add_column("ID", style="bold cyan", no_wrap=True)
+    table.add_column("Nombre", style="white")
+    table.add_column("Descripción", style="white")
+    table.add_column("Por defecto en", style="green")
+    for style_id, st in STYLES.items():
+        defaults = [name for name, prof in PROFILES.items() if prof.default_style_id == style_id]
+        table.add_row(st.id, st.label, st.description, ", ".join(defaults) if defaults else "-")
+    console.print(table)
+
+
 if __name__ == "__main__":
     # Ayuda amistosa para el estilo antiguo: `python main.py --profile ...` (sin subcomando)
     if len(sys.argv) > 1 and sys.argv[1].startswith("-") and sys.argv[1] not in ("--help", "-h"):
         console.print(
             "[bold yellow]Aviso:[/] ahora main.py usa subcomandos. Usa [bold]python main.py generate[/bold] "
             f"{escape(' '.join(sys.argv[1:]))}\n"
-            "Ejecuta [bold]python main.py --help[/bold] para ver los comandos disponibles (generate, retry-scene).\n"
+            "Ejecuta [bold]python main.py --help[/bold] para ver los comandos disponibles (generate, retry-scene, styles).\n"
         )
         raise SystemExit(2)
     app()

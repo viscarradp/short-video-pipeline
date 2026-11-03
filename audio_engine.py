@@ -1,5 +1,6 @@
 """Etapa de mezcla de audio (solo audio): voz + BGM con ducking + whooshes, y loudnorm de dos pasadas (Módulo 5a)."""
 
+import hashlib
 import json
 import math
 import os
@@ -11,6 +12,8 @@ from rich.console import Console
 from config import (
     AUDIO_CHANNELS,
     AUDIO_SAMPLE_RATE,
+    BGM_GAIN_LIMITS_DB,
+    BGM_RELATIVE_DB,
     BGM_VOLUME,
     DUCK_ATTACK_MS,
     DUCK_RATIO,
@@ -19,6 +22,8 @@ from config import (
     LOUDNORM_I,
     LOUDNORM_LRA,
     LOUDNORM_TP,
+    MUSIC_DIR,
+    MUSIC_EXTENSIONS,
     SAMPLES_PER_FRAME,
     SFX_VOLUME,
     get_ffmpeg_binary,
@@ -27,6 +32,7 @@ from pipeline_utils import (
     CacheManifest,
     PipelineError,
     RunStats,
+    file_sha256,
     fingerprint,
     run_cmd,
     scene_frames,
@@ -68,15 +74,20 @@ def transition_offsets_samples(scenes: list[dict[str, Any]]) -> list[int]:
     return [start * SAMPLES_PER_FRAME for start in scene_start_frames(scenes)[1:]]
 
 
-def build_mix_filtergraph(total_samples: int, offsets_samples: list[int], with_sfx: bool) -> str:
-    """Grafo de mezcla. Entradas: 0 = voz (wav concatenado), 1 = BGM, 2 = whoosh (solo si with_sfx)."""
+def build_mix_filtergraph(
+    total_samples: int, offsets_samples: list[int], with_sfx: bool, bgm_gain: float = BGM_VOLUME
+) -> str:
+    """Grafo de mezcla. Entradas: 0 = voz (wav concatenado), 1 = BGM, 2 = whoosh (solo si with_sfx).
+
+    `bgm_gain` es la ganancia LINEAL de la BGM (antes del ducking), calculada por `resolve_bgm_gain`.
+    """
     total_sec = total_samples / AUDIO_SAMPLE_RATE
     fade_out_start = max(total_sec - BGM_FADE_OUT_SEC, 0.5)
     parts = [
         f"[0:a]{_FMT},asplit=2[vmain][vsc]",
         # BGM en bucle, recortada al largo exacto, con fundidos, y comprimida con la voz como cadena lateral
         f"[1:a]{_FMT},aloop=loop=-1:size=2e+09,atrim=end_sample={total_samples},asetpts=PTS-STARTPTS,"
-        f"volume={BGM_VOLUME},afade=t=in:ss=0:d={BGM_FADE_IN_SEC},"
+        f"volume={bgm_gain:.4f},afade=t=in:ss=0:d={BGM_FADE_IN_SEC},"
         f"afade=t=out:st={fade_out_start:.3f}:d={BGM_FADE_OUT_SEC}[bgm]",
         f"[bgm][vsc]sidechaincompress=threshold={DUCK_THRESHOLD}:ratio={DUCK_RATIO}:"
         f"attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[bgmd]",
@@ -92,6 +103,108 @@ def build_mix_filtergraph(total_samples: int, offsets_samples: list[int], with_s
     else:
         parts.append(f"[vmain][bgmd]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,{tail}[aout]")
     return ";".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Biblioteca de música y nivel de la BGM independiente de la sonoridad de la pista
+# --------------------------------------------------------------------------- #
+
+def list_music_tracks(folder: Path) -> list[Path]:
+    """Pistas de audio (mp3/m4a/wav) directamente dentro de `folder`, ordenadas por nombre (no recursivo)."""
+    if not folder.is_dir():
+        return []
+    tracks = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in MUSIC_EXTENSIONS]
+    return sorted(tracks, key=lambda p: p.name.casefold())
+
+
+def select_library_track(slug: str, profile_name: str, music_dir: Path = MUSIC_DIR) -> Optional[Path]:
+    """Elige una pista de la biblioteca de forma determinista según el hash del slug.
+
+    Primero la subcarpeta del perfil; si no tiene pistas, el pool compartido (raíz de assets/music/). None si no hay.
+    """
+    candidates = list_music_tracks(music_dir / profile_name) or list_music_tracks(music_dir)
+    if not candidates:
+        return None
+    index = int(hashlib.sha256(slug.encode("utf-8")).hexdigest()[:8], 16) % len(candidates)
+    return candidates[index]
+
+
+def _load_loudness_cache(path: Path) -> dict[str, float]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {str(k): float(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_loudness_cache(path: Path, data: dict[str, float]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def measure_integrated_loudness(input_args: list[str], desc: str, ffmpeg_bin: str) -> Optional[float]:
+    """LUFS integrados de una entrada (loudnorm en modo medición, sin escribir nada). None si no se puede medir."""
+    res = run_cmd(
+        [
+            ffmpeg_bin, "-hide_banner", "-nostats", "-y", *input_args,
+            "-af", f"loudnorm={LOUDNORM_TARGET}:print_format=json", "-f", "null", "-",
+        ],
+        desc,
+    )
+    measured = parse_loudnorm_json(res.stderr)
+    return None if measured is None else measured["input_i"]
+
+
+def compute_bgm_gain(voice_lufs: float, music_lufs: float, relative_db: float = BGM_RELATIVE_DB) -> tuple[float, float]:
+    """(ganancia en dB, ganancia lineal) para que la música sin ducking quede `relative_db` dB bajo la voz."""
+    lo, hi = BGM_GAIN_LIMITS_DB
+    gain_db = min(max((voice_lufs + relative_db) - music_lufs, lo), hi)
+    return gain_db, round(10 ** (gain_db / 20.0), 4)
+
+
+def resolve_bgm_gain(
+    voice_concat_list: Path,
+    voice_wavs: list[Path],
+    bgm_path: Path,
+    cache_path: Path,
+    ffmpeg_bin: str,
+) -> tuple[float, Optional[float], Optional[float], Optional[float]]:
+    """Mide (con caché en `cache_path`) la voz y la música y devuelve (ganancia lineal, dB, LUFS voz, LUFS música).
+
+    Claves de caché: hash del contenido de la música / hash combinado de los wav de voz. Si algo no se puede medir,
+    devuelve la ganancia fija BGM_VOLUME con dB en None (y un aviso).
+    """
+    cache = _load_loudness_cache(cache_path)
+    dirty = False
+
+    music_key = f"music:{file_sha256(bgm_path)}"
+    music_lufs = cache.get(music_key)
+    if music_lufs is None:
+        music_lufs = measure_integrated_loudness(["-i", str(bgm_path)], f"Medición de sonoridad de {bgm_path.name}", ffmpeg_bin)
+        if music_lufs is not None:
+            cache[music_key], dirty = music_lufs, True
+
+    voice_key = "voice:" + hashlib.sha256("|".join(file_sha256(p) for p in voice_wavs).encode()).hexdigest()
+    voice_lufs = cache.get(voice_key)
+    if voice_lufs is None:
+        voice_lufs = measure_integrated_loudness(
+            ["-f", "concat", "-safe", "0", "-i", str(voice_concat_list)], "Medición de sonoridad de la voz", ffmpeg_bin
+        )
+        if voice_lufs is not None:
+            cache[voice_key], dirty = voice_lufs, True
+
+    if dirty:
+        _save_loudness_cache(cache_path, cache)
+
+    if music_lufs is None or voice_lufs is None:
+        console.print(
+            f"[bold yellow]⚠ No se pudo medir la sonoridad de la {'música' if music_lufs is None else 'voz'}; "
+            f"se usa una ganancia fija de BGM ({BGM_VOLUME}).[/bold yellow]"
+        )
+        return BGM_VOLUME, None, voice_lufs, music_lufs
+    gain_db, gain_lin = compute_bgm_gain(voice_lufs, music_lufs)
+    return gain_lin, gain_db, voice_lufs, music_lufs
 
 
 def wav_sample_count(path: Path) -> int:
@@ -178,7 +291,28 @@ def mix_audio(
     total_samples = total_frames * SAMPLES_PER_FRAME
     offsets = transition_offsets_samples(scenes)
     with_sfx = bool(offsets) and whoosh_path.exists()
-    graph = build_mix_filtergraph(total_samples, offsets, with_sfx)
+
+    missing = [p.name for p in voice_wavs if not p.is_file()]
+    if missing:
+        raise PipelineError(f"Faltan los wav de locución: {', '.join(missing)}. Ejecuta 'generate' de nuevo.")
+    if not bgm_path.is_file():
+        raise PipelineError(f"No existe el archivo de música: {bgm_path}")
+
+    ffmpeg_bin = get_ffmpeg_binary()
+
+    # Ganancia de la BGM: se mide la sonoridad de la música y de la voz (con caché) para dejar la música sin ducking
+    # BGM_RELATIVE_DB dB bajo la voz, sea cual sea la sonoridad con que se masterizó la pista.
+    concat_list = workspace_dir / "audio_concat.txt"
+    concat_list.write_text("".join(f"file '{p.as_posix()}'\n" for p in voice_wavs), encoding="utf-8")
+    bgm_gain, gain_db, voice_lufs, music_lufs = resolve_bgm_gain(
+        concat_list, voice_wavs, bgm_path, audio_dir / "loudness_cache.json", ffmpeg_bin
+    )
+    if gain_db is not None:
+        console.print(
+            f"  [dim]Música: {music_lufs:.1f} LUFS | voz: {voice_lufs:.1f} LUFS → ganancia BGM {gain_db:+.1f} dB "
+            f"(x{bgm_gain}); objetivo: {BGM_RELATIVE_DB:+g} dB respecto a la voz[/dim]"
+        )
+    graph = build_mix_filtergraph(total_samples, offsets, with_sfx, bgm_gain)
 
     mix_final = audio_dir / "mix_final.wav"
     fp = fingerprint(
@@ -187,7 +321,8 @@ def mix_audio(
         bgm=bgm_path,
         sfx=whoosh_path if with_sfx else None,
         sfx_volume=SFX_VOLUME,
-        bgm_volume=BGM_VOLUME,
+        bgm_gain=bgm_gain,
+        bgm_relative_db=BGM_RELATIVE_DB,
         duck=[DUCK_THRESHOLD, DUCK_RATIO, DUCK_ATTACK_MS, DUCK_RELEASE_MS],
         whoosh_offsets_samples=offsets if with_sfx else [],
         total_samples=total_samples,
@@ -200,19 +335,12 @@ def mix_audio(
         console.print(f"[green]✓ Mezcla de audio en caché:[/] {mix_final}")
         return mix_final
 
-    missing = [p.name for p in voice_wavs if not p.is_file()]
-    if missing:
-        raise PipelineError(f"Faltan los wav de locución: {', '.join(missing)}. Ejecuta 'generate' de nuevo.")
-
-    ffmpeg_bin = get_ffmpeg_binary()
     console.print(
         f"[cyan]Mezclando audio: voz + BGM con ducking + {len(offsets) if with_sfx else 0} whooshes, "
         f"loudnorm de dos pasadas a {LOUDNORM_I} LUFS...[/cyan]"
     )
 
     # 1. Voz: concatenación exacta por muestras de los wav por escena
-    concat_list = workspace_dir / "audio_concat.txt"
-    concat_list.write_text("".join(f"file '{p.as_posix()}'\n" for p in voice_wavs), encoding="utf-8")
     full_voice = workspace_dir / "full_voice.wav"
     run_cmd(
         [ffmpeg_bin, "-hide_banner", "-nostats", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -11,9 +12,11 @@ from pydantic import BaseModel, Field
 from rich.console import Console
 
 import fal_client
-from config import FAL_KEY
+from config import CAMERA_EFFECTS, FAL_KEY, FLUX_COST_USD, MAX_HASHTAGS, SCENE_WORDS_TOLERANCE
 from pipeline_utils import CacheManifest, PipelineError, RunStats, fingerprint
-from profiles import VideoProfile, get_profile
+from profiles import VideoProfile, get_profile, narration_word_budget
+from prompt_templates import CTA_RULE_TEMPLATE, PROFILE_INSTRUCTIONS, SYSTEM_PROMPT_TEMPLATE
+from styles import VisualStyle, get_style
 
 console = Console()
 
@@ -24,6 +27,9 @@ class CameraEffect(str, Enum):
     ZOOM_OUT = "zoom_out"
     PAN_RIGHT = "pan_right"
     PAN_LEFT = "pan_left"
+
+
+assert tuple(e.value for e in CameraEffect) == CAMERA_EFFECTS, "CameraEffect debe coincidir con config.CAMERA_EFFECTS"
 
 
 class SceneSchema(BaseModel):
@@ -37,10 +43,19 @@ class SceneSchema(BaseModel):
 
 class VideoProjectSchema(BaseModel):
     title: str
-    profile: str
-    global_visual_style: str
+    # El LLM ya NO emite profile / global_visual_style / visual_style_id: los fija el código (normalize_project).
+    profile: str = ""
+    # Estilo visual del video (styles.STYLES). Vacío = guion LEGADO: se compone con global_visual_style (ver
+    # image_engine.compose_scene_prompt_legacy) para no invalidar imágenes ya pagadas.
+    visual_style_id: str = ""
+    # Legado: texto de estilo que usaban los guiones antiguos. En guiones nuevos es solo informativo (= image_suffix).
+    global_visual_style: str = ""
     characters: dict[str, str] = Field(default_factory=dict, description="character_id -> physical description in English")
     scenes: list[SceneSchema]
+    # Campos de publicación (opcionales: los script.json antiguos sin ellos siguen cargando)
+    hook_text: str = Field(default="", description="2 a 6 palabras en español para mostrar en pantalla los primeros segundos")
+    post_description: str = Field(default="", description="1-2 frases para el pie del post, terminando en una pregunta")
+    hashtags: list[str] = Field(default_factory=list, description="5 a 8 hashtags temáticos sin '#', en minúsculas")
 
 
 def clean_llm_json_response(raw_text: str) -> str:
@@ -60,12 +75,13 @@ def clean_llm_json_response(raw_text: str) -> str:
     return text.strip()
 
 
-def build_system_prompt(profile: VideoProfile) -> str:
-    """Generate system prompt enforcing JSON schema and profile requirements."""
+def build_system_prompt(profile: VideoProfile, style: VisualStyle) -> str:
+    """Generate system prompt enforcing JSON schema, profile requirements and the resolved visual style."""
     schema_template = {
         "title": "Título corto y viral",
-        "profile": profile.name,
-        "global_visual_style": profile.global_visual_style,
+        "hook_text": "2 a 6 palabras en español, texto en pantalla de los primeros segundos",
+        "post_description": "1 o 2 frases para el pie del post; la última es una pregunta que invite a comentar",
+        "hashtags": ["hashtag1", "hashtag2", "hashtag3", "hashtag4", "hashtag5"],
         "characters": {
             "char_1": "Detailed physical description in English (age, hair, clothing, facial traits)"
         } if profile.require_characters else {},
@@ -81,26 +97,34 @@ def build_system_prompt(profile: VideoProfile) -> str:
         ]
     }
 
-    return f"""Eres un guionista experto en viralidad para videos verticales (TikTok, Reels, Shorts).
-Tu tarea es producir un guion completo en formato JSON ESTRICTO conforme a la siguiente estructura:
+    budget = narration_word_budget(profile)
+    tol = SCENE_WORDS_TOLERANCE
+    cta_rule = (
+        CTA_RULE_TEMPLATE.format(cta=profile.ending_call_to_action) if profile.ending_call_to_action else ""
+    )
 
-JSON FORMAT TEMPLATE:
-{json.dumps(schema_template, indent=2, ensure_ascii=False)}
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        schema_json=json.dumps(schema_template, indent=2, ensure_ascii=False),
+        profile_upper=profile.name.upper(),
+        profile_instructions=PROFILE_INSTRUCTIONS[profile.name],
+        scenes_min=profile.target_scenes_min,
+        scenes_max=profile.target_scenes_max,
+        words_min=max(budget - tol, 1),
+        words_max=budget + tol,
+        words_target=budget,
+        scene_seconds=f"{profile.target_scene_duration_sec:g}",
+        cta_rule=cta_rule,
+        camera_effects=str(list(CAMERA_EFFECTS)),
+        style_label=style.label,
+        style_guidance=style.scene_guidance,
+    )
 
-REGLAS ESPECÍFICAS DEL PERFIL '{profile.name.upper()}':
-{profile.system_prompt_instructions}
 
-REGLAS GENERALES OBLIGATORIAS:
-1. Responde ÚNICAMENTE con el objeto JSON válido. No agregues explicaciones, saludos ni texto antes o después.
-2. Cada narración ('narration_es') debe ser fluida, conversacional, lista para ser leída por un locutor sintético (TTS). CERO emojis, CERO notas de audio o texto entre paréntesis.
-3. Cada escena debe sugerir un 'camera_effect' entre: ['zoom_in_fast', 'zoom_in_slow', 'zoom_out', 'pan_right', 'pan_left'].
-4. 'highlight_words' debe contener de 1 a 3 palabras exactas presentes en 'narration_es' (palabras impactantes o números).
-5. Número de escenas requerido: entre {profile.target_scenes_min} y {profile.target_scenes_max}.
-"""
+def generate_mock_script(topic: str, profile: VideoProfile, style_id: str = "") -> VideoProjectSchema:
+    """Generador local de guión de demostración (solo con --mock-script; el tema NO se respeta).
 
-
-def generate_mock_script(topic: str, profile: VideoProfile) -> VideoProjectSchema:
-    """Generador local de guión de demostración (solo con --mock-script; el tema NO se respeta)."""
+    `style_id` vacío = estilo por defecto del perfil."""
+    style = get_style(style_id or profile.default_style_id)
     console.print(
         "[yellow]⚠️  Modo --mock-script: usando guión de demostración local (no corresponde al tema solicitado).[/yellow]"
     )
@@ -214,9 +238,16 @@ def generate_mock_script(topic: str, profile: VideoProfile) -> VideoProjectSchem
         return VideoProjectSchema(
             title="Qué pasa en tu motor si usas gasolina barata",
             profile=profile.name,
-            global_visual_style=profile.global_visual_style,
+            visual_style_id=style.id,
+            global_visual_style=style.image_suffix,
             characters={},
             scenes=scenes,
+            hook_text="Tu motor sufre en silencio",
+            post_description=(
+                "Ahorrar unos centavos por litro puede costarte miles en reparaciones. "
+                "¿Tú qué gasolina le pones a tu auto?"
+            ),
+            hashtags=["gasolina", "motor", "mecanica", "autos", "datoscuriosos", "ahorro", "octanaje"],
         )
     else:
         # Micronovela fallback
@@ -301,9 +332,16 @@ def generate_mock_script(topic: str, profile: VideoProfile) -> VideoProjectSchem
         return VideoProjectSchema(
             title=topic,
             profile=profile.name,
-            global_visual_style=profile.global_visual_style,
+            visual_style_id=style.id,
+            global_visual_style=style.image_suffix,
             characters=characters,
             scenes=scenes,
+            hook_text="Nadie debía saberlo",
+            post_description=(
+                "Un secreto familiar escondido durante años acaba de salir a la luz. "
+                "¿Tú qué habrías hecho en su lugar?"
+            ),
+            hashtags=["micronovela", "historiareal", "secretosfamiliares", "drama", "suspenso", "herencia", "chisme"],
         )
 
 
@@ -313,27 +351,72 @@ def _word_tokens(text: str) -> list[str]:
     return [t for t in tokens if t]
 
 
+def normalize_hashtags(tags: list[str], limit: int = MAX_HASHTAGS) -> list[str]:
+    """Quita '#', pasa a minúsculas, elimina espacios, acentos y símbolos, descarta duplicados y recorta a `limit`."""
+    result: list[str] = []
+    for raw in tags:
+        text = unicodedata.normalize("NFKD", str(raw).lower())
+        text = "".join(c for c in text if not unicodedata.combining(c))
+        text = re.sub(r"[^a-z0-9_]", "", text)  # '#', espacios, signos y cualquier otro carácter
+        if text and text not in result:
+            result.append(text)
+    return result[:limit]
+
+
+def _cta_key(text: str) -> str:
+    """Forma comparable de un texto: minúsculas, sin puntuación ni espacios repetidos (conserva los acentos)."""
+    return " ".join(re.sub(r"[^\w]+", " ", text.lower()).split())
+
+
+def ends_with_cta(narration: str, cta: str) -> bool:
+    """True si la narración termina con la frase `cta`, ignorando mayúsculas y puntuación."""
+    cta_key = _cta_key(cta)
+    return bool(cta_key) and _cta_key(narration).endswith(cta_key)
+
+
+def append_cta(narration: str, cta: str) -> str:
+    """Añade ". " + cta al final (sin duplicar el punto si la narración ya termina en .!?…)."""
+    base = narration.rstrip()
+    sep = " " if base.endswith((".", "!", "?", "…")) else ". "
+    return f"{base}{sep}{cta}"
+
+
 def light_normalize_project(project: VideoProjectSchema, profile: VideoProfile) -> bool:
     """Normalización ligera (también para guiones en caché o editados a mano): sin validar el nº de escenas.
 
-    Renumera scene_id 1..N y fuerza perfil y estilo visual global. Devuelve True si algo cambió.
+    Renumera scene_id 1..N, fuerza el perfil, normaliza hashtags/textos de publicación y garantiza la frase de
+    cierre del perfil (si existe) al final de la última narración. NO toca global_visual_style ni visual_style_id:
+    el estilo de un guion existente es suyo (los prompts de imagen ya pagados dependen de él). Devuelve True si
+    algo cambió.
     """
     before = project.model_dump()
     project.profile = profile.name
-    project.global_visual_style = profile.global_visual_style
     for idx, scene in enumerate(project.scenes, start=1):
         scene.scene_id = idx
+    project.hook_text = " ".join(project.hook_text.split())
+    project.post_description = " ".join(project.post_description.split())
+    project.hashtags = normalize_hashtags(project.hashtags)
+    cta = profile.ending_call_to_action
+    if cta and project.scenes and not ends_with_cta(project.scenes[-1].narration_es, cta):
+        project.scenes[-1].narration_es = append_cta(project.scenes[-1].narration_es, cta)
     return project.model_dump() != before
 
 
-def normalize_project(project: VideoProjectSchema, profile: VideoProfile) -> VideoProjectSchema:
-    """Normalize an LLM-produced project in place; raise ValueError if scene count is out of bounds."""
+def normalize_project(project: VideoProjectSchema, profile: VideoProfile, style_id: str = "") -> VideoProjectSchema:
+    """Normalize an LLM-produced project in place; raise ValueError if scene count is out of bounds.
+
+    Fija el estilo visual resuelto (`style_id` vacío = por defecto del perfil); es el único lugar, junto con el
+    guion mock, donde se asigna visual_style_id a un guion nuevo."""
     n_scenes = len(project.scenes)
     if not (profile.target_scenes_min <= n_scenes <= profile.target_scenes_max):
         raise ValueError(
             f"El guión tiene {n_scenes} escenas; el perfil '{profile.name}' requiere entre "
             f"{profile.target_scenes_min} y {profile.target_scenes_max}."
         )
+
+    style = get_style(style_id or profile.default_style_id)
+    project.visual_style_id = style.id
+    project.global_visual_style = style.image_suffix  # informativo; la composición usa visual_style_id
 
     light_normalize_project(project, profile)
 
@@ -359,6 +442,28 @@ def write_script(project: VideoProjectSchema, script_path: Path) -> None:
     _write_script(project, script_path)
 
 
+def read_cached_style_id(script_path: Path) -> Optional[str]:
+    """visual_style_id del script.json existente: None si no existe o no es válido; "" si es un guion legado."""
+    try:
+        data = json.loads(Path(script_path).read_text(encoding="utf-8"))
+        return VideoProjectSchema.model_validate(data).visual_style_id
+    except Exception:
+        return None
+
+
+def resolve_style_id(explicit: Optional[str], script_path: Path, profile: VideoProfile) -> str:
+    """Estilo de una ejecución: --style explícito > visual_style_id del guion en caché > default del perfil.
+
+    Un guion legado en caché (sin estilo) sigue siendo legado: devuelve "" (así sus imágenes pagadas se conservan).
+    Lanza ValueError (con la lista de estilos) si el id resultante no existe."""
+    if explicit:
+        return get_style(explicit).id
+    cached = read_cached_style_id(script_path)
+    if cached is not None:
+        return get_style(cached).id if cached else ""
+    return get_style(profile.default_style_id).id
+
+
 def generate_or_load_script(
     topic: str,
     profile_name: str,
@@ -367,10 +472,14 @@ def generate_or_load_script(
     force: bool = False,
     mock_script: bool = False,
     stats: Optional[RunStats] = None,
+    style_id: str = "",
 ) -> VideoProjectSchema:
     """Carga el guion en caché (respetando ediciones manuales) o lo genera con Fal.ai any-llm.
 
-    Huella: tema + perfil + flag mock. Nunca cae silenciosamente a mock.
+    Huella: tema + perfil + flag mock (el estilo NO forma parte). Nunca cae silenciosamente a mock.
+
+    `style_id` es el estilo ya resuelto (ver resolve_style_id). En un guion nuevo, vacío = default del perfil. En un
+    guion en caché, vacío = no tocar; un id distinto del guardado actualiza script.json (con aviso de coste).
     """
     script_path = output_dir / "script.json"
     legacy_mock_marker = output_dir / "script.mock"  # marcador de Fase 1, reemplazado por el manifiesto
@@ -396,9 +505,23 @@ def generate_or_load_script(
                 with open(script_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 project = VideoProjectSchema.model_validate(data)
-                if light_normalize_project(project, profile):
+                changed = light_normalize_project(project, profile)
+                if style_id and style_id != project.visual_style_id:
+                    new_style = get_style(style_id)
+                    previous = project.visual_style_id or "legado"
+                    project.visual_style_id = new_style.id
+                    project.global_visual_style = new_style.image_suffix  # informativo
+                    changed = True
+                    n = len(project.scenes)
+                    console.print(
+                        f"[yellow]⚠ Estilo visual cambiado de '{previous}' a '{new_style.id}'. En modo real se "
+                        f"regenerarán las {n} imágenes (~${n * FLUX_COST_USD:.2f}, unos ${FLUX_COST_USD} cada una) "
+                        "porque el prompt compuesto cambia. Los 'visual_prompt_en' existentes se escribieron para el "
+                        "estilo anterior: usa --force-script para reescribirlos (también regenera imágenes).[/yellow]"
+                    )
+                if changed:
                     _write_script(project, script_path)
-                    console.print("  [dim]script.json normalizado (ids de escena / perfil / estilo global) y reescrito.[/dim]")
+                    console.print("  [dim]script.json normalizado / actualizado y reescrito.[/dim]")
                 if legacy_mock_marker.exists():
                     legacy_mock_marker.unlink()
                 console.print(f"[green]✓ Guion en caché:[/] {script_path} ({len(project.scenes)} escenas)")
@@ -417,7 +540,7 @@ def generate_or_load_script(
             stats.script = True
 
     if mock_script:
-        project = generate_mock_script(topic, profile)
+        project = generate_mock_script(topic, profile, style_id)
         _persist(project)
         return project
 
@@ -432,7 +555,8 @@ def generate_or_load_script(
         )
 
     # Call Fal.ai any-llm (google/gemini-2.5-flash) with up to 3 attempts
-    system_prompt = build_system_prompt(profile)
+    style = get_style(style_id or profile.default_style_id)
+    system_prompt = build_system_prompt(profile, style)
     base_user_prompt = (
         f"Tema del video: {topic}\nPerfil: {profile.name}\n"
         "Genera el guión JSON completo siguiendo todas las reglas."
@@ -462,7 +586,7 @@ def generate_or_load_script(
             cleaned_json = clean_llm_json_response(raw_output)
             data = json.loads(cleaned_json)
             project = VideoProjectSchema.model_validate(data)
-            project = normalize_project(project, profile)
+            project = normalize_project(project, profile, style.id)
 
             # Persist script only once a valid, normalized project exists
             _persist(project)

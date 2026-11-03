@@ -11,6 +11,7 @@ from config import (
     ASSETS_DIR,
     FONTS_DIR,
     AUDIO_DIR,
+    MUSIC_DIR,
     WORKSPACE_DIR,
     SUBTITLE_FONT_FILENAME,
     SUBTITLE_FONT_URL,
@@ -51,7 +52,10 @@ def verify_libass_support(ffmpeg_bin: str) -> bool:
 
 def ensure_directories() -> None:
     """Create all required project directories."""
-    for directory in [ASSETS_DIR, FONTS_DIR, AUDIO_DIR, WORKSPACE_DIR]:
+    from profiles import PROFILES  # import local: evita ciclos y solo se necesita aquí
+
+    music_dirs = [MUSIC_DIR] + [MUSIC_DIR / name for name in PROFILES]  # raíz = pool compartido + una carpeta por perfil
+    for directory in [ASSETS_DIR, FONTS_DIR, AUDIO_DIR, WORKSPACE_DIR, *music_dirs]:
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -147,6 +151,7 @@ def check_and_prepare_environment() -> dict[str, str]:
         "font": str(FONTS_DIR / SUBTITLE_FONT_FILENAME),
         "whoosh": str(AUDIO_DIR / "whoosh.mp3"),
         "bgm": str(AUDIO_DIR / "ambient_drone.mp3"),
+        "music_dir": str(MUSIC_DIR),
     }
 
 

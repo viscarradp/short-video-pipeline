@@ -1,17 +1,38 @@
-"""Viral dynamic subtitle constructor with ASS format and pop-in animation (Módulo 4)."""
+"""Viral dynamic subtitle constructor with ASS format: karaoke word highlight + hook text overlay (Módulo 4)."""
 
-import json
 import re
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
+from PIL import ImageFont
 from rich.console import Console
 
 from config import (
-    VIDEO_FPS,
-    VIDEO_WIDTH,
-    VIDEO_HEIGHT,
-    SUBTITLE_FONT_NAME,
+    FONTS_DIR,
+    HOOK_BOX_COLOR,
+    HOOK_BOX_PADDING,
+    HOOK_FONT_SIZE,
+    HOOK_MAX_SEC,
+    HOOK_POS_Y_FRAC,
+    HOOK_TEXT_COLOR,
+    SUBTITLE_ACTIVE_COLOR,
+    SUBTITLE_ACTIVE_SCALE,
     SUBTITLE_FONT_BOLD,
+    SUBTITLE_FONT_FILENAME,
+    SUBTITLE_FONT_NAME,
+    SUBTITLE_FONT_SIZE,
+    SUBTITLE_KEYWORD_COLOR,
+    SUBTITLE_LIBASS_EM_RATIO,
+    SUBTITLE_MARGIN_LR,
+    SUBTITLE_MAX_LINE_WIDTH_PX,
+    SUBTITLE_NORMAL_COLOR,
+    SUBTITLE_OUTLINE,
+    SUBTITLE_POS_Y_FRAC,
+    SUBTITLE_SHADOW,
+    SUBTITLE_SPACING,
+    VIDEO_FPS,
+    VIDEO_HEIGHT,
+    VIDEO_WIDTH,
 )
 from pipeline_utils import scene_frames
 
@@ -43,7 +64,11 @@ def sanitize_ass_text(text: str) -> str:
 
 
 def build_ass_header(font_name: str = SUBTITLE_FONT_NAME, bold: int = SUBTITLE_FONT_BOLD) -> str:
-    """Generate ASS script header with 1080x1920 resolution and viral style."""
+    """Cabecera ASS 1080x1920 con el estilo de subtítulos (ViralTikTok) y el del texto gancho (Hook).
+
+    Ambos estilos usan alineación central (5/8) y se posicionan con \\pos en cada evento (la zona segura está en config).
+    El Hook usa BorderStyle 3: caja opaca del color de OutlineColour con HOOK_BOX_PADDING px de relleno.
+    """
     return f"""[Script Info]
 Title: TikTok Viral Dynamic Subtitles
 ScriptType: v4.00+
@@ -55,11 +80,43 @@ PlayResY: {VIDEO_HEIGHT}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralTikTok,{font_name},72,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,2,0,1,6,3,2,60,60,620,1
+Style: ViralTikTok,{font_name},{SUBTITLE_FONT_SIZE},{SUBTITLE_NORMAL_COLOR[:-1]},&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,1,{SUBTITLE_OUTLINE},{SUBTITLE_SHADOW},5,{SUBTITLE_MARGIN_LR},{SUBTITLE_MARGIN_LR},0,1
+Style: Hook,{font_name},{HOOK_FONT_SIZE},{HOOK_TEXT_COLOR[:-1]},&H000000FF,{HOOK_BOX_COLOR[:-1]},&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,3,{HOOK_BOX_PADDING},0,8,{SUBTITLE_MARGIN_LR},{SUBTITLE_MARGIN_LR},0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+
+
+# --------------------------------------------------------------------------- #
+# Medición de ancho (para partir bloques que no caben en SUBTITLE_MAX_LINE_WIDTH_PX)
+# --------------------------------------------------------------------------- #
+
+@lru_cache(maxsize=1)
+def _measure_font() -> Optional[Any]:
+    """Fuente PIL a 1000 px para medir avances de glifos; None si falta el archivo (se usa una estimación)."""
+    try:
+        return ImageFont.truetype(str(FONTS_DIR / SUBTITLE_FONT_FILENAME), 1000)
+    except Exception:
+        return None
+
+
+def measure_text_width(text: str, font_size: float = SUBTITLE_FONT_SIZE) -> float:
+    """Ancho estimado en px (a PlayResX) de `text` en una línea: avance de glifos + espaciado + contorno."""
+    font = _measure_font()
+    em_px = font_size * SUBTITLE_LIBASS_EM_RATIO
+    if font is not None:
+        advance = font.getlength(text) * em_px / 1000.0
+    else:  # sin la fuente: estimación conservadora para mayúsculas
+        advance = 0.78 * em_px * len(text)
+    return advance + SUBTITLE_SPACING * len(text) + 2 * SUBTITLE_OUTLINE
+
+
+def chunk_display_width(display_words: list[str]) -> float:
+    """Ancho de un bloque en su peor caso: la línea completa más el crecimiento de la palabra activa más ancha (pop)."""
+    full = measure_text_width(" ".join(display_words))
+    widest = max((measure_text_width(w) for w in display_words), default=0.0)
+    return full + widest * (SUBTITLE_ACTIVE_SCALE - 100) / 100.0
 
 
 def chunk_words(words: list[dict[str, Any]], max_chunk_size: int = 3) -> list[list[dict[str, Any]]]:
@@ -88,6 +145,30 @@ def chunk_words(words: list[dict[str, Any]], max_chunk_size: int = 3) -> list[li
     return chunks
 
 
+def fit_chunks_to_width(
+    chunks: list[list[dict[str, Any]]],
+    display: Callable[[dict[str, Any]], str],
+    max_width: float = SUBTITLE_MAX_LINE_WIDTH_PX,
+) -> list[list[dict[str, Any]]]:
+    """Parte los bloques cuyo ancho supera `max_width` en bloques más pequeños (de 1 a 3 palabras), de forma voraz.
+
+    Una palabra suelta nunca se parte (si aun así excede el ancho, libass la ajusta dentro de los márgenes).
+    """
+    fitted: list[list[dict[str, Any]]] = []
+    for chunk in chunks:
+        current: list[dict[str, Any]] = []
+        for word in chunk:
+            trial = current + [word]
+            if current and chunk_display_width([display(w) for w in trial]) > max_width:
+                fitted.append(current)
+                current = [word]
+            else:
+                current = trial
+        if current:
+            fitted.append(current)
+    return fitted
+
+
 def clamp_chunk_ends(events: list[dict[str, Any]], timeline_end_ms: int) -> None:
     """Recorta in situ el fin de cada bloque al inicio del siguiente (menos 1 cs) y al final de la línea de tiempo.
 
@@ -100,90 +181,173 @@ def clamp_chunk_ends(events: list[dict[str, Any]], timeline_end_ms: int) -> None
         ev["end_ms"] = max(min(ev["end_ms"], limit), ev["start_ms"] + CHUNK_GAP_MS)
 
 
-def generate_subtitles_ass(
-    timing_metadata: dict[str, Any],
-    output_ass_path: Path,
-    font_name: str = SUBTITLE_FONT_NAME,
-) -> Path:
-    """Calculate cumulative continuous timeline and produce styled animated ASS subtitles."""
-    console.print("[cyan]Generando subtítulos dinámicos estilo TikTok (.ass)...[/cyan]")
+# --------------------------------------------------------------------------- #
+# Karaoke: un evento ASS por porción de tiempo de cada palabra del bloque
+# --------------------------------------------------------------------------- #
 
-    header = build_ass_header(font_name=font_name)
-    events: list[dict[str, Any]] = []
+def karaoke_slices(start_ms: int, end_ms: int, word_starts: list[int]) -> list[tuple[int, int, int]]:
+    """Porciones (inicio, fin, índice de palabra) contiguas que cubren exactamente [start_ms, end_ms).
+
+    La palabra i está activa desde su inicio hasta el inicio de la siguiente (los silencios entre palabras del mismo
+    bloque se le asignan a la anterior); la última llega hasta `end_ms`. Las porciones de menos de 1 cs se descartan
+    y la anterior se extiende, así que nunca quedan huecos.
+    """
+    bounds: list[int] = []
+    last = start_ms
+    for ws in word_starts:
+        last = min(max(ws, last), end_ms)  # monótono y dentro del bloque
+        bounds.append(last)
+    bounds[0] = start_ms  # el bloque aparece con su primera palabra activa
+    slices: list[tuple[int, int, int]] = []
+    for i, b in enumerate(bounds):
+        e = bounds[i + 1] if i + 1 < len(bounds) else end_ms
+        if e - b < CHUNK_GAP_MS:
+            if slices:
+                s0, _e0, i0 = slices[-1]
+                slices[-1] = (s0, e, i0)  # la porción previa absorbe el tramo descartado
+            continue
+        slices.append((b, e, i))
+    return slices
+
+
+def chunk_base_scale(display_words: list[str], max_width: float = SUBTITLE_MAX_LINE_WIDTH_PX) -> int:
+    """Escala (%) de todo el bloque: 100 salvo que, ya dividido, aún no quepa (una palabra larguísima): se encoge."""
+    width = chunk_display_width(display_words)
+    return 100 if width <= max_width else max(int(100 * max_width / width), 40)
+
+
+def render_chunk_text(display_words: list[str], keyword_flags: list[bool], active_idx: int, base_scale: int = 100) -> str:
+    """Texto del evento: palabra activa en amarillo con pop, palabras clave en su color, el resto en blanco.
+
+    `base_scale` (%) encoge todo el bloque cuando una sola palabra es más ancha que el máximo.
+    """
+    active_scale = round(SUBTITLE_ACTIVE_SCALE * base_scale / 100)
+    parts = []
+    for i, word in enumerate(display_words):
+        if i == active_idx:
+            parts.append(
+                f"{{\\c{SUBTITLE_ACTIVE_COLOR}\\fscx{active_scale}\\fscy{active_scale}}}{word}"
+                f"{{\\c{SUBTITLE_NORMAL_COLOR}\\fscx{base_scale}\\fscy{base_scale}}}"
+            )
+        elif keyword_flags[i]:
+            parts.append(f"{{\\c{SUBTITLE_KEYWORD_COLOR}}}{word}{{\\c{SUBTITLE_NORMAL_COLOR}}}")
+        else:
+            parts.append(word)
+    scale_tag = f"\\fscx{base_scale}\\fscy{base_scale}" if base_scale != 100 else ""
+    pos = f"{{\\an5\\pos({VIDEO_WIDTH // 2},{round(VIDEO_HEIGHT * SUBTITLE_POS_Y_FRAC)}){scale_tag}}}"
+    return pos + " ".join(parts)
+
+
+def build_karaoke_events(timing_metadata: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """Eventos de subtítulos (uno por palabra activa) y duración total en ms. Nunca hay dos eventos a la vez.
+
+    Cada evento: start_ms, end_ms, text, chunk (nº de bloque), active (índice de la palabra activa en el bloque).
+    """
     fps = timing_metadata.get("fps", VIDEO_FPS)
-
+    chunk_events: list[dict[str, Any]] = []
     cumulative_frames = 0
+
+    def display(item: dict[str, Any]) -> str:
+        return sanitize_ass_text(item.get("word", "")).upper()
 
     for scene in timing_metadata.get("scenes", []):
         frames = scene_frames(scene, fps)
         scene_duration_ms = round(frames * 1000 / fps)
         cumulative_offset_ms = round(cumulative_frames * 1000 / fps)  # sin acumular redondeos
-        raw_words = scene.get("words", [])
-        highlight_keywords = {
-            clean_word_for_matching(w) for w in scene.get("highlight_words", [])
-        }
+        raw_words = list(scene.get("words", []))
+        highlight_keywords = {clean_word_for_matching(w) for w in scene.get("highlight_words", [])}
 
         # Fallback if words list is empty: synthesize evenly distributed word timings
         if not raw_words:
-            narration = scene.get("narration_es", "")
-            tokens = narration.split()
+            tokens = scene.get("narration_es", "").split()
             if tokens:
                 step_ms = scene_duration_ms / max(len(tokens), 1)
                 for idx, token in enumerate(tokens):
                     start = int(idx * step_ms)
                     end = int((idx + 1) * step_ms)
-                    raw_words.append({
-                        "word": token,
-                        "start_ms": start,
-                        "end_ms": end,
-                        "duration_ms": end - start,
-                    })
+                    raw_words.append({"word": token, "start_ms": start, "end_ms": end, "duration_ms": end - start})
 
-        # Group words into chunks of 2-3 words
-        word_chunks = chunk_words(raw_words, max_chunk_size=3)
-
-        for chunk in word_chunks:
+        # Bloques de 2-3 palabras, partidos si no caben en el ancho máximo
+        for chunk in fit_chunks_to_width(chunk_words(raw_words, max_chunk_size=3), display):
             if not chunk:
                 continue
-
             chunk_start_ms = cumulative_offset_ms + chunk[0]["start_ms"]
             chunk_end_ms = cumulative_offset_ms + chunk[-1]["end_ms"]
-
             # Ensure minimum visibility duration (clamp_chunk_ends later trims overlaps with the next chunk)
             if chunk_end_ms - chunk_start_ms < MIN_CHUNK_MS:
                 chunk_end_ms = chunk_start_ms + MIN_CHUNK_MS
 
-            # Format words inside chunk with uppercase and keyword highlighting
-            formatted_words = []
+            keyword_flags = []
             for item in chunk:
-                raw_token = item.get("word", "")
-                clean_token = clean_word_for_matching(raw_token)
-                display_word = sanitize_ass_text(raw_token).upper()
+                clean_token = clean_word_for_matching(item.get("word", ""))
+                # palabra clave: coincide con highlight_words o contiene números
+                keyword_flags.append(clean_token in highlight_keywords or any(c.isdigit() for c in clean_token))
 
-                # Check if word should be highlighted (match or contains numbers)
-                is_highlight = clean_token in highlight_keywords or any(c.isdigit() for c in clean_token)
-                if is_highlight:
-                    # Bright Yellow highlight: &H0000FFFF&, restore to White: &H00FFFFFF&
-                    formatted_words.append(r"{\c&H0000FFFF&}" + display_word + r"{\c&H00FFFFFF&}")
-                else:
-                    formatted_words.append(display_word)
-
-            text_content = " ".join(formatted_words)
-
-            # Pop-in bounce animation transform: start at 120% scale, shrink to 100% in 65ms
-            animation_tag = r"{\fscx120\fscy120\t(0,65,\fscx100\fscy100)}"
-            dialogue_text = f"{animation_tag}{text_content}"
-
-            events.append({"start_ms": chunk_start_ms, "end_ms": chunk_end_ms, "text": dialogue_text})
+            chunk_events.append({
+                "start_ms": chunk_start_ms,
+                "end_ms": chunk_end_ms,
+                "display": [display(item) for item in chunk],
+                "keywords": keyword_flags,
+                "word_starts": [cumulative_offset_ms + item["start_ms"] for item in chunk],
+            })
 
         # Advance continuous cumulative timeline by exact (frame-based) scene duration
         cumulative_frames += frames
 
-    clamp_chunk_ends(events, round(cumulative_frames * 1000 / fps))
+    total_ms = round(cumulative_frames * 1000 / fps)
+    clamp_chunk_ends(chunk_events, total_ms)
+
+    events: list[dict[str, Any]] = []
+    for chunk_idx, ce in enumerate(chunk_events):
+        for start, end, active in karaoke_slices(ce["start_ms"], ce["end_ms"], ce["word_starts"]):
+            events.append({
+                "start_ms": start,
+                "end_ms": end,
+                "text": render_chunk_text(ce["display"], ce["keywords"], active, chunk_base_scale(ce["display"])),
+                "scale": chunk_base_scale(ce["display"]),
+                "chunk": chunk_idx,
+                "active": active,
+            })
+    return events, total_ms
+
+
+def build_hook_event(hook_text: str, timing_metadata: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Evento del texto gancho: de 0 al fin de la escena 1 (máx. HOOK_MAX_SEC). None si no hay texto."""
+    clean = " ".join(sanitize_ass_text(hook_text or "").split()).upper()
+    if not clean:
+        return None
+    fps = timing_metadata.get("fps", VIDEO_FPS)
+    scenes = timing_metadata.get("scenes", [])
+    scene1_ms = round(scene_frames(scenes[0], fps) * 1000 / fps) if scenes else round(HOOK_MAX_SEC * 1000)
+    end_ms = min(scene1_ms, round(HOOK_MAX_SEC * 1000))
+    top_y = round(VIDEO_HEIGHT * HOOK_POS_Y_FRAC)
+    return {"start_ms": 0, "end_ms": end_ms, "text": f"{{\\an8\\pos({VIDEO_WIDTH // 2},{top_y})}}{clean}"}
+
+
+def generate_subtitles_ass(
+    timing_metadata: dict[str, Any],
+    output_ass_path: Path,
+    font_name: str = SUBTITLE_FONT_NAME,
+    hook_text: str = "",
+) -> Path:
+    """Calculate cumulative continuous timeline and produce styled karaoke ASS subtitles (+ optional hook overlay)."""
+    console.print("[cyan]Generando subtítulos dinámicos estilo TikTok (.ass)...[/cyan]")
+
+    header = build_ass_header(font_name=font_name)
+    events, _total_ms = build_karaoke_events(timing_metadata)
     dialogue_lines = [
         f"Dialogue: 0,{ms_to_ass_time(ev['start_ms'])},{ms_to_ass_time(ev['end_ms'])},ViralTikTok,,0,0,0,,{ev['text']}"
         for ev in events
     ]
+    chunks = len({ev["chunk"] for ev in events})
+
+    hook = build_hook_event(hook_text, timing_metadata)
+    if hook:
+        # Capa 1 (sobre los subtítulos); va primero para quedar ordenado por inicio
+        dialogue_lines.insert(
+            0,
+            f"Dialogue: 1,{ms_to_ass_time(hook['start_ms'])},{ms_to_ass_time(hook['end_ms'])},Hook,,0,0,0,,{hook['text']}",
+        )
 
     full_ass_content = header + "\n".join(dialogue_lines) + "\n"
 
@@ -196,5 +360,8 @@ def generate_subtitles_ass(
         with open(output_ass_path, "w", encoding="utf-8") as f:
             f.write(full_ass_content)
 
-    console.print(f"[green]✓ Archivo ASS generado:[/] {output_ass_path} ({len(dialogue_lines)} bloques animados)")
+    console.print(
+        f"[green]✓ Archivo ASS generado:[/] {output_ass_path} "
+        f"({chunks} bloques, {len(events)} eventos karaoke{', con texto gancho' if hook else ''})"
+    )
     return output_ass_path

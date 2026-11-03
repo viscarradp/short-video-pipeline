@@ -1,11 +1,17 @@
 """FFmpeg Video Assembly and Rendering Engine (Módulo 5)."""
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Optional
 from rich.console import Console
 
 from config import (
+    CAMERA_EFFECTS,
+    CLIP_RENDER_WORKERS,
+    DEFAULT_CAMERA_EFFECT,
+    REACH_HASHTAGS,
     VIDEO_WIDTH,
     VIDEO_HEIGHT,
     VIDEO_FPS,
@@ -14,8 +20,8 @@ from config import (
     FONTS_DIR,
     get_ffmpeg_binary,
 )
-from pipeline_utils import CacheManifest, RunStats, fingerprint, run_cmd, scene_frames
-from script_engine import VideoProjectSchema
+from pipeline_utils import CacheManifest, PipelineError, RunStats, fingerprint, run_cmd, scene_frames
+from script_engine import VideoProjectSchema, normalize_hashtags
 
 console = Console()
 
@@ -36,26 +42,21 @@ def build_zoompan_filter(
     # 1. Upscale to 2160x3840 (supersampling to avoid integer jitter)
     # 2. Apply smooth zoompan
     # 3. Downscale back to 1080x1920 with lanczos
-    if camera_effect == "zoom_in_fast":
-        zoom_expr = "min(zoom+0.0022,1.35)"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
-    elif camera_effect == "zoom_out":
-        zoom_expr = "if(lte(on,1),1.25,max(1.001,zoom-0.0012))"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
-    elif camera_effect == "pan_right":
-        zoom_expr = "1.15"
-        x_expr = f"(iw-iw/zoom)*(on/{total_frames})"
-        y_expr = "ih/2-(ih/zoom/2)"
-    elif camera_effect == "pan_left":
-        zoom_expr = "1.15"
-        x_expr = f"(iw-iw/zoom)*(1-on/{total_frames})"
-        y_expr = "ih/2-(ih/zoom/2)"
-    else:  # default zoom_in_slow
-        zoom_expr = "min(zoom+0.0012,1.25)"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
+    effect = camera_effect if camera_effect in CAMERA_EFFECTS else DEFAULT_CAMERA_EFFECT
+    center_x = "iw/2-(iw/zoom/2)"
+    center_y = "ih/2-(ih/zoom/2)"
+    if effect == "zoom_in_fast":
+        zoom_expr, x_expr, y_expr = "min(zoom+0.0022,1.35)", center_x, center_y
+    elif effect == "zoom_in_slow":
+        zoom_expr, x_expr, y_expr = "min(zoom+0.0012,1.25)", center_x, center_y
+    elif effect == "zoom_out":
+        zoom_expr, x_expr, y_expr = "if(lte(on,1),1.25,max(1.001,zoom-0.0012))", center_x, center_y
+    elif effect == "pan_right":
+        zoom_expr, x_expr, y_expr = "1.15", f"(iw-iw/zoom)*(on/{total_frames})", center_y
+    elif effect == "pan_left":
+        zoom_expr, x_expr, y_expr = "1.15", f"(iw-iw/zoom)*(1-on/{total_frames})", center_y
+    else:  # pragma: no cover - CAMERA_EFFECTS y esta cadena deben mantenerse sincronizadas
+        raise PipelineError(f"Efecto de cámara sin implementar en video_engine: {effect}")
 
     filter_str = (
         f"scale=2160:3840,"
@@ -65,15 +66,8 @@ def build_zoompan_filter(
     return filter_str
 
 
-def render_scene_clip(
-    image_path: Path,
-    output_clip_path: Path,
-    frames: int,
-    camera_effect: str,
-    manifest: CacheManifest,
-    force: bool = False,
-) -> bool:
-    """Render one scene image into an animated MP4 clip of EXACTLY `frames` frames. True if rendered, False on cache hit."""
+def clip_fingerprint(image_path: Path, frames: int, camera_effect: str) -> tuple[str, str]:
+    """(huella, filtro de video) de un clip: depende del contenido de la imagen, los fotogramas, el efecto y los ajustes."""
     vf_filter = build_zoompan_filter(camera_effect, frames, VIDEO_FPS)
     fp = fingerprint(
         kind="clip",
@@ -88,9 +82,11 @@ def render_scene_clip(
         pix_fmt=VIDEO_PIX_FMT,
         input_mode="single_frame",
     )
-    if not force and manifest.is_fresh(output_clip_path, fp) and output_clip_path.stat().st_size > 1000:
-        return False
+    return fp, vf_filter
 
+
+def encode_scene_clip(image_path: Path, output_clip_path: Path, frames: int, vf_filter: str) -> None:
+    """Ejecuta ffmpeg y deja el clip en su sitio (escritura atómica). NO toca el manifiesto: es seguro en hilos."""
     ffmpeg_bin = get_ffmpeg_binary()
     part_path = output_clip_path.with_name(output_clip_path.stem + ".part.mp4")
 
@@ -116,8 +112,27 @@ def render_scene_clip(
         str(part_path),
     ]
 
-    run_cmd(cmd, f"Render del clip {output_clip_path.name}")
-    os.replace(part_path, output_clip_path)
+    try:
+        run_cmd(cmd, f"Render del clip {output_clip_path.name}")
+        os.replace(part_path, output_clip_path)
+    finally:
+        if part_path.exists():  # un render fallido no deja .part.mp4 huérfanos
+            part_path.unlink(missing_ok=True)
+
+
+def render_scene_clip(
+    image_path: Path,
+    output_clip_path: Path,
+    frames: int,
+    camera_effect: str,
+    manifest: CacheManifest,
+    force: bool = False,
+) -> bool:
+    """Render one scene image into an animated MP4 clip of EXACTLY `frames` frames. True if rendered, False on cache hit."""
+    fp, vf_filter = clip_fingerprint(image_path, frames, camera_effect)
+    if not force and manifest.is_fresh(output_clip_path, fp) and output_clip_path.stat().st_size > 1000:
+        return False
+    encode_scene_clip(image_path, output_clip_path, frames, vf_filter)
     manifest.record(output_clip_path, fp)
     return True
 
@@ -129,12 +144,18 @@ def render_all_scene_clips(
     manifest: CacheManifest,
     force: bool = False,
     stats: Optional[RunStats] = None,
+    workers: int = CLIP_RENDER_WORKERS,
 ) -> list[Path]:
-    """Render all scene video clips (per-clip cache by image hash + frame count + effect)."""
+    """Render all scene video clips (per-clip cache by image hash + frame count + effect), in parallel.
+
+    Los subprocesos ffmpeg corren en un ThreadPoolExecutor; el manifiesto, las estadísticas y los mensajes se
+    actualizan solo en el hilo principal y solo cuando un clip termina bien. Si alguno falla, los demás terminan,
+    quedan registrados, y al final se lanza un PipelineError que lista los clips fallidos.
+    """
     clips_dir.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
-    rendered = 0
     cached_count = 0
+    pending: list[tuple[int, Path, Path, int, str, str, str]] = []  # (id, imagen, clip, fotogramas, huella, filtro, detalle)
 
     scenes = timing_metadata.get("scenes", [])
     console.print(f"[cyan]Clips de video dinámicos a {VIDEO_FPS} fps para {len(scenes)} escenas...[/cyan]")
@@ -142,32 +163,56 @@ def render_all_scene_clips(
     for scene in scenes:
         scene_id = scene["scene_id"]
         frames = scene_frames(scene, VIDEO_FPS)
-        duration_sec = frames / VIDEO_FPS
         camera_effect = scene.get("camera_effect", "zoom_in_slow")
+        detail = f"{frames} fotogramas, {frames / VIDEO_FPS:.3f}s, {camera_effect}"
 
         img_path = images_dir / f"scene_{scene_id:02d}.png"
         clip_path = clips_dir / f"clip_{scene_id:02d}.mp4"
-
-        did_render = render_scene_clip(
-            image_path=img_path,
-            output_clip_path=clip_path,
-            frames=frames,
-            camera_effect=camera_effect,
-            manifest=manifest,
-            force=force,
-        )
         clips.append(clip_path)
-        detail = f"{frames} fotogramas, {duration_sec:.3f}s, {camera_effect}"
-        if did_render:
-            rendered += 1
-            if stats is not None:
-                stats.clips.append(scene_id)
-            console.print(f"  [green]✓ Clip {scene_id:02d} renderizado ({detail})[/green]")
-        else:
+
+        fp, vf_filter = clip_fingerprint(img_path, frames, camera_effect)
+        if not force and manifest.is_fresh(clip_path, fp) and clip_path.stat().st_size > 1000:
             cached_count += 1
             console.print(f"  [green]✓ Clip {scene_id:02d} en caché ({detail})[/green]")
+        else:
+            pending.append((scene_id, img_path, clip_path, frames, fp, vf_filter, detail))
+
+    rendered = 0
+    failures: list[str] = []
+    if pending:
+        n_workers = max(1, min(workers, len(pending)))
+        mode = f"{n_workers} procesos en paralelo" if n_workers > 1 else "1 proceso (secuencial)"
+        console.print(f"  [cyan]Renderizando {len(pending)} clips con {mode}...[/cyan]")
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(encode_scene_clip, img_path, clip_path, frames, vf_filter): (scene_id, clip_path, fp, detail)
+                for scene_id, img_path, clip_path, frames, fp, vf_filter, detail in pending
+            }
+            for fut in as_completed(futures):
+                scene_id, clip_path, fp, detail = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:  # PipelineError de ffmpeg u OSError al mover el archivo
+                    lines = [ln.strip() for ln in str(e).splitlines() if ln.strip()]
+                    failures.append(f"clip {scene_id:02d}: {' | '.join(lines[-2:])[:300] if lines else type(e).__name__}")
+                    console.print(f"  [red]✗ Clip {scene_id:02d} falló[/red]")
+                    continue
+                manifest.record(clip_path, fp)  # solo tras un render exitoso, y solo desde el hilo principal
+                rendered += 1
+                if stats is not None:
+                    stats.clips.append(scene_id)
+                console.print(f"  [green]✓ Clip {scene_id:02d} renderizado ({detail})[/green]")
+        console.print(
+            f"  [dim]Etapa de clips: {time.time() - t0:.1f} s con {mode} ({len(pending)} clips a renderizar).[/dim]"
+        )
 
     console.print(f"[bold green]✓ Clips: {rendered} renderizados, {cached_count} en caché.[/bold green]")
+    if failures:
+        raise PipelineError(
+            f"Falló el render de {len(failures)} clip(s); los exitosos quedaron en caché. "
+            "Vuelve a ejecutar para reintentar solo los faltantes.\n" + "\n".join(failures)
+        )
     return clips
 
 
@@ -203,6 +248,7 @@ def assemble_final_video(
     )
     if not force and manifest.is_fresh(output_final_path, fp) and output_final_path.stat().st_size > 10_000:
         console.print(f"[green]✓ Video final en caché:[/] {output_final_path}")
+        generate_post_metadata(project, workspace_dir)  # barato; solo reescribe si el guion cambió
         return output_final_path
 
     ffmpeg_bin = get_ffmpeg_binary()
@@ -281,27 +327,50 @@ def assemble_final_video(
     return output_final_path
 
 
-def generate_post_metadata(project: VideoProjectSchema, workspace_dir: Path) -> Path:
-    """Generate ready-to-copy post description with title and 5 viral hashtags."""
-    metadata_file = workspace_dir / "post_metadata.txt"
+PROFILE_FALLBACK_TAGS = {
+    "curiosity": ["#datoscuriosos", "#ciencia", "#aprendeentiktok", "#mecanica", "#curiosidades"],
+    "micronovela": ["#historiareal", "#suspenso", "#drama", "#chismesito", "#novelas"],
+}
 
-    profile_tags = {
-        "curiosity": ["#datoscuriosos", "#ciencia", "#aprendeentiktok", "#mecanica", "#curiosidades"],
-        "micronovela": ["#historiareal", "#suspenso", "#drama", "#chismesito", "#novelas"],
-    }
-    tags = profile_tags.get(project.profile, ["#viral", "#shorts", "#reels", "#fyp", "#tendencia"])
 
-    content = f"""TITULO SUGERIDO:
+def build_post_metadata_text(project: VideoProjectSchema) -> str:
+    """Texto de post_metadata.txt: título + descripción + hashtags del LLM (con respaldo estático si faltan)
+    y siempre las etiquetas genéricas de alcance (REACH_HASHTAGS) al final."""
+    description = project.post_description.strip()
+    if not description:
+        description = (
+            "¿Sabías esto? Mira lo que ocurre paso a paso. "
+            f"{'Parte 2 disponible en el perfil.' if project.profile == 'micronovela' else 'Comparte con tus amigos.'}"
+        )
+
+    tags = [f"#{t}" for t in normalize_hashtags(project.hashtags)]
+    if not tags:
+        tags = PROFILE_FALLBACK_TAGS.get(project.profile, ["#viral", "#reels", "#tendencia"])
+    for reach in REACH_HASHTAGS:
+        if reach.lower() not in {t.lower() for t in tags}:
+            tags.append(reach)
+
+    return f"""TITULO SUGERIDO:
 {project.title}
 
 DESCRIPCIÓN:
-¿Sabías esto? Mira lo que ocurre paso a paso. {'Parte 2 disponible en el perfil.' if project.profile == 'micronovela' else 'Comparte con tus amigos.'}
+{description}
 
 HASHTAGS:
 {' '.join(tags)}
 """
-    with open(metadata_file, "w", encoding="utf-8") as f:
-        f.write(content)
 
-    console.print(f"[green]✓ Metadatos de publicación generados:[/] {metadata_file}")
+
+def generate_post_metadata(project: VideoProjectSchema, workspace_dir: Path) -> Path:
+    """Escribe post_metadata.txt (título, descripción y hashtags listos para copiar); solo reescribe si cambió."""
+    metadata_file = workspace_dir / "post_metadata.txt"
+    content = build_post_metadata_text(project)
+    try:
+        unchanged = metadata_file.exists() and metadata_file.read_text(encoding="utf-8") == content
+    except Exception:
+        unchanged = False
+    if not unchanged:
+        with open(metadata_file, "w", encoding="utf-8") as f:
+            f.write(content)
+        console.print(f"[green]✓ Metadatos de publicación generados:[/] {metadata_file}")
     return metadata_file
