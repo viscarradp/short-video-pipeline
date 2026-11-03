@@ -2,11 +2,11 @@
 
 import os
 import shutil
-import subprocess
 import urllib.request
 from pathlib import Path
 from rich.console import Console
 
+from pipeline_utils import run_cmd
 from config import (
     ASSETS_DIR,
     FONTS_DIR,
@@ -24,7 +24,7 @@ console = Console()
 def verify_ffmpeg_binary(ffmpeg_bin: str) -> bool:
     """Check if ffmpeg executable exists and runs."""
     try:
-        res = subprocess.run([ffmpeg_bin, "-version"], capture_output=True, text=True, check=True)
+        res = run_cmd([ffmpeg_bin, "-version"], "ffmpeg -version")
         return "ffmpeg version" in res.stdout
     except Exception:
         return False
@@ -33,7 +33,7 @@ def verify_ffmpeg_binary(ffmpeg_bin: str) -> bool:
 def verify_ffprobe_binary(ffprobe_bin: str) -> bool:
     """Check if ffprobe executable exists and runs."""
     try:
-        res = subprocess.run([ffprobe_bin, "-version"], capture_output=True, text=True, check=True)
+        res = run_cmd([ffprobe_bin, "-version"], "ffprobe -version")
         return "ffprobe version" in res.stdout
     except Exception:
         return False
@@ -42,7 +42,7 @@ def verify_ffprobe_binary(ffprobe_bin: str) -> bool:
 def verify_libass_support(ffmpeg_bin: str) -> bool:
     """Check if ffmpeg has subtitles/ass filter support."""
     try:
-        res = subprocess.run([ffmpeg_bin, "-filters"], capture_output=True, text=True, check=True)
+        res = run_cmd([ffmpeg_bin, "-filters"], "ffmpeg -filters")
         has_sub = " subtitles " in res.stdout or " ass " in res.stdout
         return has_sub
     except Exception:
@@ -64,8 +64,10 @@ def ensure_font_asset() -> Path:
     console.print(f"[yellow]Downloading font: {SUBTITLE_FONT_FILENAME}...[/yellow]")
     headers = {"User-Agent": "ShortVideoPipeline/1.0"}
     req = urllib.request.Request(SUBTITLE_FONT_URL, headers=headers)
-    with urllib.request.urlopen(req) as resp, open(font_path, "wb") as f:
+    tmp_path = font_path.with_suffix(font_path.suffix + ".tmp")
+    with urllib.request.urlopen(req, timeout=30) as resp, open(tmp_path, "wb") as f:
         shutil.copyfileobj(resp, f)
+    os.replace(tmp_path, font_path)
 
     console.print(f"[green]✓ Font saved to {font_path}[/green]")
     return font_path
@@ -90,7 +92,7 @@ def ensure_synthetic_audio_assets(ffmpeg_bin: str) -> tuple[Path, Path]:
             "2",
             str(whoosh_path),
         ]
-        subprocess.run(cmd_whoosh, capture_output=True, check=True)
+        run_cmd(cmd_whoosh, "Generación del SFX whoosh")
         console.print(f"[green]✓ Generated {whoosh_path}[/green]")
 
     # Generate ambient background music if missing
@@ -107,7 +109,7 @@ def ensure_synthetic_audio_assets(ffmpeg_bin: str) -> tuple[Path, Path]:
             "2",
             str(bgm_path),
         ]
-        subprocess.run(cmd_bgm, capture_output=True, check=True)
+        run_cmd(cmd_bgm, "Generación de la música ambiental")
         console.print(f"[green]✓ Generated {bgm_path}[/green]")
 
     return whoosh_path, bgm_path

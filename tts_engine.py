@@ -2,13 +2,13 @@
 
 import asyncio
 import json
-import subprocess
 from pathlib import Path
 from typing import Any, Optional
 from rich.console import Console
 
 import edge_tts
 from config import get_ffprobe_binary
+from pipeline_utils import is_stale, run_cmd
 from profiles import VideoProfile
 from script_engine import VideoProjectSchema
 
@@ -28,8 +28,20 @@ def get_audio_duration_seconds(audio_path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(audio_path),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    res = run_cmd(cmd, f"ffprobe de {audio_path.name}")
     return float(res.stdout.strip())
+
+
+def load_words_sidecar(words_path: Path) -> list[dict[str, Any]]:
+    """Carga los tiempos por palabra guardados; devuelve [] si falta o es inválido."""
+    if not words_path.exists():
+        return []
+    try:
+        with open(words_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 async def generate_single_scene_audio(
@@ -44,12 +56,16 @@ async def generate_single_scene_audio(
 
     for attempt in range(1, max_retries + 1):
         try:
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice,
-                rate=rate,
-                boundary="WordBoundary",
-            )
+            try:
+                communicate = edge_tts.Communicate(
+                    text=text,
+                    voice=voice,
+                    rate=rate,
+                    boundary="WordBoundary",
+                )
+            except TypeError:
+                # Versiones antiguas de edge-tts no aceptan 'boundary' (ya emiten WordBoundary)
+                communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
 
             words: list[dict[str, Any]] = []
             audio_data = bytearray()
@@ -102,12 +118,13 @@ async def generate_all_scene_audios(
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = audio_dir / "timing_metadata.json"
+    script_path = output_dir / "script.json"
 
     voice = voice_override if voice_override else profile.default_voice
     rate = profile.voice_rate
 
     # Check cache
-    if metadata_path.exists() and not force:
+    if metadata_path.exists() and not force and not is_stale(metadata_path, script_path):
         try:
             with open(metadata_path, "r", encoding="utf-8") as f:
                 cached_data = json.load(f)
@@ -133,13 +150,19 @@ async def generate_all_scene_audios(
         audio_filename = f"scene_{scene.scene_id:02d}.mp3"
         audio_path = audio_dir / audio_filename
 
+        words_path = audio_dir / f"scene_{scene.scene_id:02d}.words.json"
+
         # Individual cache check
-        if audio_path.exists() and audio_path.stat().st_size > 500 and not force:
+        words: list[dict[str, Any]] = []
+        cached = False
+        if audio_path.exists() and audio_path.stat().st_size > 500 and not force and not is_stale(audio_path, script_path):
+            words = load_words_sidecar(words_path)
+            if words:
+                cached = True
+
+        if cached:
             real_duration = get_audio_duration_seconds(audio_path)
-            # Try to recover words or synthesize if words missing
-            console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Audio en caché ({real_duration:.2f}s)[/green]")
-            # If we don't have existing metadata words, re-synthesize or approximate
-            words = []
+            console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Audio en caché ({real_duration:.2f}s, {len(words)} palabras)[/green]")
         else:
             words = await generate_single_scene_audio(
                 text=scene.narration_es,
@@ -147,8 +170,15 @@ async def generate_all_scene_audios(
                 rate=rate,
                 output_mp3=audio_path,
             )
+            with open(words_path, "w", encoding="utf-8") as f:
+                json.dump(words, f, indent=2, ensure_ascii=False)
             real_duration = get_audio_duration_seconds(audio_path)
             console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Generado ({real_duration:.2f}s, {len(words)} palabras)[/green]")
+            if not words and scene.narration_es.strip():
+                console.print(
+                    f"  [bold yellow]⚠ Escena {scene.scene_id:02d}: edge-tts no devolvió tiempos por palabra. "
+                    "Los subtítulos de esta escena usarán espaciado uniforme (menos preciso).[/bold yellow]"
+                )
             await asyncio.sleep(0.2)
 
         scenes_timing.append({
@@ -170,8 +200,14 @@ async def generate_all_scene_audios(
         "scenes": scenes_timing,
     }
 
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(timing_metadata, f, indent=2, ensure_ascii=False)
+    # Only rewrite when content changed so the mtime (used for downstream staleness) advances on real change
+    serialized = json.dumps(timing_metadata, indent=2, ensure_ascii=False)
+    try:
+        unchanged = metadata_path.exists() and metadata_path.read_text(encoding="utf-8") == serialized
+    except Exception:
+        unchanged = False
+    if not unchanged:
+        metadata_path.write_text(serialized, encoding="utf-8")
 
     console.print(f"[bold green]✓ Todos los audios generados. Duración total: {total_duration:.2f} segundos.[/bold green]")
     return timing_metadata

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,7 @@ from rich.console import Console
 
 import fal_client
 from config import FAL_KEY
+from pipeline_utils import PipelineError
 from profiles import VideoProfile, get_profile
 
 console = Console()
@@ -98,9 +100,9 @@ REGLAS GENERALES OBLIGATORIAS:
 
 
 def generate_mock_script(topic: str, profile: VideoProfile) -> VideoProjectSchema:
-    """Fallback generator when FAL_KEY is not yet configured for offline demonstration."""
+    """Generador local de guión de demostración (solo con --mock-script; el tema NO se respeta)."""
     console.print(
-        "[yellow]⚠️  FAL_KEY no detectada en .env o entorno. Generando guión estructurado local para pruebas...[/yellow]"
+        "[yellow]⚠️  Modo --mock-script: usando guión de demostración local (no corresponde al tema solicitado).[/yellow]"
     )
     if profile.name == "curiosity":
         scenes = [
@@ -305,17 +307,57 @@ def generate_mock_script(topic: str, profile: VideoProfile) -> VideoProjectSchem
         )
 
 
+def _word_tokens(text: str) -> list[str]:
+    """Lowercase tokens of a text with punctuation stripped (accent-sensitive)."""
+    tokens = (re.sub(r"[^\w]", "", t.lower()) for t in text.split())
+    return [t for t in tokens if t]
+
+
+def normalize_project(project: VideoProjectSchema, profile: VideoProfile) -> VideoProjectSchema:
+    """Normalize an LLM-produced project in place; raise ValueError if scene count is out of bounds."""
+    n_scenes = len(project.scenes)
+    if not (profile.target_scenes_min <= n_scenes <= profile.target_scenes_max):
+        raise ValueError(
+            f"El guión tiene {n_scenes} escenas; el perfil '{profile.name}' requiere entre "
+            f"{profile.target_scenes_min} y {profile.target_scenes_max}."
+        )
+
+    project.profile = profile.name
+    project.global_visual_style = profile.global_visual_style
+
+    for idx, scene in enumerate(project.scenes, start=1):
+        scene.scene_id = idx
+        narration_tokens = set(_word_tokens(scene.narration_es))
+        kept: list[str] = []
+        for hw in scene.highlight_words:
+            hw_tokens = _word_tokens(hw)
+            if hw_tokens and all(t in narration_tokens for t in hw_tokens):
+                kept.append(hw)
+        scene.highlight_words = kept
+
+    return project
+
+
+def _write_script(project: VideoProjectSchema, script_path: Path) -> None:
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(project.model_dump_json(indent=2))
+
+
 def generate_or_load_script(
     topic: str,
     profile_name: str,
     output_dir: Path,
     force: bool = False,
+    mock_script: bool = False,
 ) -> VideoProjectSchema:
-    """Load cached script or generate a new one via Fal.ai any-llm."""
+    """Load cached script or generate a new one via Fal.ai any-llm (never silently falls back to mock)."""
     script_path = output_dir / "script.json"
+    mock_marker = output_dir / "script.mock"
 
-    # Idempotency / Cache Check
-    if script_path.exists() and not force:
+    # Idempotency / Cache Check (a mock script is never a valid cache entry for a real run)
+    if script_path.exists() and not force and not mock_script and mock_marker.exists():
+        console.print("[yellow]Aviso: el script.json en caché es de demostración (--mock-script); se regenerará con el LLM.[/yellow]")
+    elif script_path.exists() and not force:
         try:
             with open(script_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -327,20 +369,29 @@ def generate_or_load_script(
 
     profile = get_profile(profile_name)
 
+    if mock_script:
+        project = generate_mock_script(topic, profile)
+        _write_script(project, script_path)
+        mock_marker.touch()
+        return project
+
     # Set FAL_KEY in os.environ for fal_client if configured
     if FAL_KEY:
         os.environ["FAL_KEY"] = FAL_KEY
 
-    # If FAL_KEY is not available, use the high-quality local generator
     if not os.getenv("FAL_KEY"):
-        project = generate_mock_script(topic, profile)
-        with open(script_path, "w", encoding="utf-8") as f:
-            f.write(project.model_dump_json(indent=2))
-        return project
+        raise PipelineError(
+            "No se encontró FAL_KEY. Define FAL_KEY en el archivo .env (ver .env.example) "
+            "o usa --mock-script para generar un guión de demostración local."
+        )
 
-    # Call Fal.ai any-llm (google/gemini-2.5-flash) with up to 3 retries
+    # Call Fal.ai any-llm (google/gemini-2.5-flash) with up to 3 attempts
     system_prompt = build_system_prompt(profile)
-    user_prompt = f"Tema del video: {topic}\nPerfil: {profile.name}\nGenera el guión JSON completo siguiendo todas las reglas."
+    base_user_prompt = (
+        f"Tema del video: {topic}\nPerfil: {profile.name}\n"
+        "Genera el guión JSON completo siguiendo todas las reglas."
+    )
+    user_prompt = base_user_prompt
 
     console.print(f"[cyan]Llamando a Fal.ai (any-llm / google/gemini-2.5-flash) para '{topic}'...[/cyan]")
 
@@ -365,22 +416,32 @@ def generate_or_load_script(
             cleaned_json = clean_llm_json_response(raw_output)
             data = json.loads(cleaned_json)
             project = VideoProjectSchema.model_validate(data)
+            project = normalize_project(project, profile)
 
-            # Persist script in disk
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(project.model_dump_json(indent=2))
+            # Persist script only once a valid, normalized project exists
+            _write_script(project, script_path)
+            if mock_marker.exists():
+                mock_marker.unlink()
 
             console.print(f"[green]✓ Guión generado y validado con Pydantic ({len(project.scenes)} escenas).[/green]")
             return project
 
         except Exception as err:
             last_error = err
-            console.print(f"[yellow]Intento {attempt}/{max_retries} falló: {err}. Reintentando...[/yellow]")
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                console.print(
+                    f"[yellow]Intento {attempt}/{max_retries} falló: {str(err)[:300]}. Reintentando en {wait}s...[/yellow]"
+                )
+                user_prompt = (
+                    f"{base_user_prompt}\n\n"
+                    f"Tu respuesta anterior fue rechazada por este error:\n{str(err)[:500]}\n"
+                    "Corrige el problema y devuelve ÚNICAMENTE el JSON válido completo."
+                )
+                time.sleep(wait)
+            else:
+                console.print(f"[yellow]Intento {attempt}/{max_retries} falló: {str(err)[:300]}.[/yellow]")
 
-    # If all API retries failed, fallback to mock script to prevent crash
-    console.print(f"[bold red]Error en Fal.ai tras {max_retries} intentos: {last_error}[/bold red]")
-    console.print("[yellow]Usando guión de contingencia para no bloquear el pipeline...[/yellow]")
-    project = generate_mock_script(topic, profile)
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(project.model_dump_json(indent=2))
-    return project
+    raise PipelineError(
+        f"No se pudo generar un guión válido tras {max_retries} intentos. Último error: {str(last_error)[:500]}"
+    )

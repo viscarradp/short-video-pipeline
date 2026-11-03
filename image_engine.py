@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import random
 import textwrap
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,7 @@ from config import (
     FONTS_DIR,
     SUBTITLE_FONT_FILENAME,
 )
+from pipeline_utils import PipelineError, is_stale
 from script_engine import SceneSchema, VideoProjectSchema
 
 console = Console()
@@ -88,6 +90,8 @@ def create_mock_scene_image(
     draw.text((width // 2, height - 120), footer_text, fill=(160, 170, 190), font=font_title, anchor="mm")
 
     img.save(output_path, "PNG")
+    # Marker sidecar: prevents debug cards from being reused as real images
+    output_path.with_suffix(".mock").touch()
     return output_path
 
 
@@ -114,53 +118,82 @@ async def generate_single_flux_image(
     prompt: str,
     output_path: Path,
     semaphore: asyncio.Semaphore,
+    max_attempts: int = 3,
 ) -> Path:
-    """Call fal-ai/flux/schnell and download image to disk."""
-    async with semaphore:
-        if FAL_KEY:
-            os.environ["FAL_KEY"] = FAL_KEY
+    """Call fal-ai/flux/schnell (with retries, NSFW check) and download image to disk."""
+    if FAL_KEY:
+        os.environ["FAL_KEY"] = FAL_KEY
 
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(
-            None,
-            lambda: fal_client.run(
-                "fal-ai/flux/schnell",
-                arguments={
-                    "prompt": prompt,
-                    "image_size": "portrait_16_9",
-                    "num_inference_steps": 4,
-                    "enable_safety_checker": False,
-                },
-            ),
-        )
+    loop = asyncio.get_running_loop()
+    last_error: Optional[Exception] = None
 
-        images = res.get("images", [])
-        if not images or not images[0].get("url"):
-            raise ValueError(f"Fal.ai flux/schnell no devolvió imágenes: {res}")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            seed = random.randint(0, 2**31 - 1)
+            async with semaphore:
+                res = await loop.run_in_executor(
+                    None,
+                    lambda: fal_client.run(
+                        "fal-ai/flux/schnell",
+                        arguments={
+                            "prompt": prompt,
+                            "image_size": "portrait_16_9",
+                            "num_inference_steps": 4,
+                            "enable_safety_checker": True,
+                            "seed": seed,
+                        },
+                    ),
+                )
 
-        image_url = images[0]["url"]
+                images = res.get("images", [])
+                if not images or not images[0].get("url"):
+                    raise ValueError(f"Fal.ai flux/schnell no devolvió imágenes: {res}")
 
-        # Download image and ensure 1080x1920
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(image_url)
-            resp.raise_for_status()
-            image_bytes = resp.content
+                nsfw_flags = res.get("has_nsfw_concepts") or []
+                if nsfw_flags and nsfw_flags[0]:
+                    raise ValueError("La imagen fue marcada como NSFW por el filtro de seguridad")
 
-        # Save and ensure format
-        temp_path = output_path.with_suffix(".tmp")
-        with open(temp_path, "wb") as f:
-            f.write(image_bytes)
+                image_url = images[0]["url"]
 
-        with Image.open(temp_path) as im:
-            rgb_im = im.convert("RGB")
-            if rgb_im.size != (VIDEO_WIDTH, VIDEO_HEIGHT):
-                rgb_im = rgb_im.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-            rgb_im.save(output_path, "PNG")
+                # Download image
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.get(image_url)
+                    resp.raise_for_status()
+                    image_bytes = resp.content
 
-        if temp_path.exists():
-            temp_path.unlink()
+            # Save and ensure 1080x1920 PNG
+            temp_path = output_path.with_suffix(".tmp")
+            with open(temp_path, "wb") as f:
+                f.write(image_bytes)
 
-        return output_path
+            try:
+                with Image.open(temp_path) as im:
+                    rgb_im = im.convert("RGB")
+                    if rgb_im.size != (VIDEO_WIDTH, VIDEO_HEIGHT):
+                        rgb_im = rgb_im.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+                    rgb_im.save(output_path, "PNG")
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+
+            # A real image replaces any previous mock card
+            mock_marker = output_path.with_suffix(".mock")
+            if mock_marker.exists():
+                mock_marker.unlink()
+
+            return output_path
+
+        except Exception as err:
+            last_error = err
+            if attempt < max_attempts:
+                wait = 2 ** attempt
+                console.print(
+                    f"  [yellow]Intento {attempt}/{max_attempts} falló para {output_path.name}: "
+                    f"{str(err)[:200]}. Reintentando en {wait}s...[/yellow]"
+                )
+                await asyncio.sleep(wait)
+
+    raise PipelineError(f"{output_path.name}: {last_error}")
 
 
 async def generate_all_images(
@@ -170,12 +203,23 @@ async def generate_all_images(
     force: bool = False,
 ) -> list[Path]:
     """Generate or retrieve all scene images with idempotency cache."""
+    if not mock_images:
+        if FAL_KEY:
+            os.environ["FAL_KEY"] = FAL_KEY
+        if not os.getenv("FAL_KEY"):
+            raise PipelineError(
+                "No se encontró FAL_KEY. Define FAL_KEY en el archivo .env (ver .env.example) "
+                "o usa --mock-images para generar imágenes de depuración locales."
+            )
+
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
     semaphore = asyncio.Semaphore(3)  # Maximum 3 concurrent requests to Fal.ai
+    script_path = output_dir / "script.json"
     image_paths: list[Path] = []
-    tasks = []
+    pending: list[tuple[int, Path, Path]] = []  # (scene_id, image_path, marker_path)
+    coros = []
 
     console.print(
         f"[cyan]Procesando imágenes para {len(project.scenes)} escenas "
@@ -184,33 +228,46 @@ async def generate_all_images(
 
     for scene in project.scenes:
         image_path = images_dir / f"scene_{scene.scene_id:02d}.png"
+        mock_marker = image_path.with_suffix(".mock")
         image_paths.append(image_path)
 
-        # Idempotency / Cache Check
-        if image_path.exists() and image_path.stat().st_size > 5000 and not force:
+        # Idempotency / Cache Check (a mock card is never a valid cache entry in real mode)
+        is_cached = (
+            image_path.exists()
+            and image_path.stat().st_size > 5000
+            and not force
+            and not is_stale(image_path, script_path)
+        )
+        if is_cached and not mock_images and mock_marker.exists():
+            console.print(f"  [yellow]Escena {scene.scene_id:02d}: la imagen en caché es un mock; se regenerará[/yellow]")
+            is_cached = False
+        if is_cached:
             console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Imagen en caché[/green] ({image_path.name})")
             continue
 
-        if mock_images or not os.getenv("FAL_KEY"):
-            if not mock_images and not os.getenv("FAL_KEY"):
-                console.print(f"  [yellow]⚠️ FAL_KEY no detectada. Usando mock para escena {scene.scene_id:02d}[/yellow]")
+        if mock_images:
             create_mock_scene_image(scene, image_path)
             console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Mock generado (Pillow)[/green]")
         else:
             final_prompt = compose_scene_prompt(scene, project)
-            task = generate_single_flux_image(final_prompt, image_path, semaphore)
-            tasks.append((scene.scene_id, task))
+            pending.append((scene.scene_id, image_path, mock_marker))
+            coros.append(generate_single_flux_image(final_prompt, image_path, semaphore))
 
-    if tasks:
-        console.print(f"[cyan]Ejecutando {len(tasks)} peticiones concurrentes a Fal.ai Flux...[/cyan]")
-        for scene_id, task in tasks:
-            try:
-                await task
+    if coros:
+        console.print(f"[cyan]Ejecutando {len(coros)} peticiones concurrentes a Fal.ai Flux (máx. 3 simultáneas)...[/cyan]")
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        failures: list[str] = []
+        for (scene_id, _img, _marker), result in zip(pending, results):
+            if isinstance(result, BaseException):
+                console.print(f"  [red]✗ Escena {scene_id:02d}: {result}[/red]")
+                failures.append(f"escena {scene_id:02d}: {result}")
+            else:
                 console.print(f"  [green]✓ Escena {scene_id:02d}: Imagen Flux/schnell descargada[/green]")
-            except Exception as err:
-                console.print(f"  [red]✗ Error en escena {scene_id:02d}: {err}. Fallback a mock image.[/red]")
-                fallback_scene = next(s for s in project.scenes if s.scene_id == scene_id)
-                create_mock_scene_image(fallback_scene, images_dir / f"scene_{scene_id:02d}.png")
+        if failures:
+            raise PipelineError(
+                f"Falló la generación de {len(failures)} imagen(es); las exitosas quedaron en caché. "
+                "Vuelve a ejecutar para reintentar solo las faltantes.\n" + "\n".join(failures)
+            )
 
     console.print("[bold green]✓ Todas las imágenes listas en 1080x1920.[/bold green]")
     return image_paths

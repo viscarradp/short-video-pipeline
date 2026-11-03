@@ -1,7 +1,5 @@
 """FFmpeg Video Assembly and Rendering Engine (Módulo 5)."""
 
-import os
-import subprocess
 from pathlib import Path
 from typing import Any
 from rich.console import Console
@@ -15,9 +13,9 @@ from config import (
     SFX_VOLUME,
     BGM_VOLUME,
     FONTS_DIR,
-    AUDIO_DIR,
     get_ffmpeg_binary,
 )
+from pipeline_utils import is_stale, run_cmd
 from script_engine import VideoProjectSchema
 
 console = Console()
@@ -69,9 +67,15 @@ def render_scene_clip(
     duration_sec: float,
     camera_effect: str,
     force: bool = False,
+    extra_inputs: tuple[Path, ...] = (),
 ) -> Path:
     """Render a single scene image into an animated MP4 clip matching audio duration."""
-    if output_clip_path.exists() and output_clip_path.stat().st_size > 1000 and not force:
+    if (
+        output_clip_path.exists()
+        and output_clip_path.stat().st_size > 1000
+        and not force
+        and not is_stale(output_clip_path, image_path, *extra_inputs)
+    ):
         return output_clip_path
 
     ffmpeg_bin = get_ffmpeg_binary()
@@ -100,7 +104,7 @@ def render_scene_clip(
         str(output_clip_path),
     ]
 
-    subprocess.run(cmd, capture_output=True, check=True)
+    run_cmd(cmd, f"Render del clip {output_clip_path.name}")
     return output_clip_path
 
 
@@ -113,6 +117,7 @@ def render_all_scene_clips(
     """Render all scene video clips."""
     clips_dir.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
+    metadata_path = images_dir.parent / "audio" / "timing_metadata.json"
 
     scenes = timing_metadata.get("scenes", [])
     console.print(f"[cyan]Renderizando {len(scenes)} clips de video dinámicos a {VIDEO_FPS} fps...[/cyan]")
@@ -131,6 +136,7 @@ def render_all_scene_clips(
             duration_sec=duration_sec,
             camera_effect=camera_effect,
             force=force,
+            extra_inputs=(metadata_path,),
         )
         clips.append(clip_path)
         console.print(f"  [green]✓ Clip {scene_id:02d} renderizado ({duration_sec:.2f}s, {camera_effect})[/green]")
@@ -149,7 +155,16 @@ def assemble_final_video(
     force: bool = False,
 ) -> Path:
     """Concatenate clips, mix audio tracks (voice, whoosh SFX, BGM), and burn subtitles."""
-    if output_final_path.exists() and output_final_path.stat().st_size > 10_000 and not force:
+    final_inputs = [
+        workspace_dir / "clips" / f"clip_{sc['scene_id']:02d}.mp4" for sc in timing_metadata.get("scenes", [])
+    ]
+    final_inputs += [subtitles_ass_path, workspace_dir / "audio" / "timing_metadata.json"]
+    if (
+        output_final_path.exists()
+        and output_final_path.stat().st_size > 10_000
+        and not force
+        and not is_stale(output_final_path, *final_inputs)
+    ):
         console.print(f"[green]✓ Video final existente en caché:[/] {output_final_path}")
         return output_final_path
 
@@ -190,7 +205,7 @@ def assemble_final_video(
         "pcm_s16le",
         str(full_voice_path),
     ]
-    subprocess.run(cmd_voice, capture_output=True, check=True)
+    run_cmd(cmd_voice, "Concatenación de audio de locución")
 
     # Concatenate video clips without audio
     raw_video_path = workspace_dir / "raw_video.mp4"
@@ -207,7 +222,7 @@ def assemble_final_video(
         "copy",
         str(raw_video_path),
     ]
-    subprocess.run(cmd_concat_video, capture_output=True, check=True)
+    run_cmd(cmd_concat_video, "Concatenación de clips de video")
 
     # 3. Build audio mixing graph: voice (vol 1.0) + whooshes (vol 0.18) + bgm (vol 0.10)
     # Transitions happen at the start of each scene starting from scene 2
@@ -247,9 +262,9 @@ def assemble_final_video(
             filter_complex_parts.append(f"[w{i}]adelay={delay_ms}|{delay_ms}[dw{i}]")
         sfx_inputs = "".join(f"[dw{i}]" for i in range(num_trans))
         filter_complex_parts.append(f"{sfx_inputs}amix=inputs={num_trans}:dropout_transition=0:normalize=0[all_sfx]")
-        filter_complex_parts.append("[voice][bgm][all_sfx]amix=inputs=3:duration=first:dropout_transition=0[aout]")
+        filter_complex_parts.append("[voice][bgm][all_sfx]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
     else:
-        filter_complex_parts.append("[voice][bgm]amix=inputs=2:duration=first:dropout_transition=0[aout]")
+        filter_complex_parts.append("[voice][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
 
     # Subtitles video filter in filter_complex
     escaped_ass = str(subtitles_ass_path).replace("\\", "/").replace(":", "\\:")
@@ -292,10 +307,12 @@ def assemble_final_video(
         "-b:a",
         "192k",
         "-shortest",
+        "-movflags",
+        "+faststart",
         str(output_final_path),
     ])
 
-    subprocess.run(cmd_final, capture_output=True, check=True)
+    run_cmd(cmd_final, "Render final (mezcla de audio y subtítulos)")
     console.print(f"[bold green]✓ Video final exportado exitosamente:[/] {output_final_path}")
 
     # Generate post metadata

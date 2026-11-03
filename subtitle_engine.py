@@ -31,6 +31,11 @@ def clean_word_for_matching(word: str) -> str:
     return re.sub(r"[^\w]", "", word.lower())
 
 
+def sanitize_ass_text(text: str) -> str:
+    """Neutraliza caracteres especiales de ASS (llaves y barra invertida) en texto derivado de la narración."""
+    return text.replace("{", "(").replace("}", ")").replace("\\", "/")
+
+
 def build_ass_header(font_name: str = SUBTITLE_FONT_NAME) -> str:
     """Generate ASS script header with 1080x1920 resolution and viral style."""
     return f"""[Script Info]
@@ -135,7 +140,7 @@ def generate_subtitles_ass(
             for item in chunk:
                 raw_token = item.get("word", "")
                 clean_token = clean_word_for_matching(raw_token)
-                display_word = raw_token.upper()
+                display_word = sanitize_ass_text(raw_token).upper()
 
                 # Check if word should be highlighted (match or contains numbers)
                 is_highlight = clean_token in highlight_keywords or any(c.isdigit() for c in clean_token)
@@ -159,8 +164,14 @@ def generate_subtitles_ass(
 
     full_ass_content = header + "\n".join(dialogue_lines) + "\n"
 
-    with open(output_ass_path, "w", encoding="utf-8") as f:
-        f.write(full_ass_content)
+    # Only rewrite when content changed so the mtime (used for downstream staleness) advances on real change
+    try:
+        unchanged = output_ass_path.exists() and output_ass_path.read_text(encoding="utf-8") == full_ass_content
+    except Exception:
+        unchanged = False
+    if not unchanged:
+        with open(output_ass_path, "w", encoding="utf-8") as f:
+            f.write(full_ass_content)
 
     console.print(f"[green]✓ Archivo ASS generado:[/] {output_ass_path} ({len(dialogue_lines)} bloques animados)")
     return output_ass_path
