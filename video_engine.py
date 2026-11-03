@@ -1,7 +1,8 @@
 """FFmpeg Video Assembly and Rendering Engine (Módulo 5)."""
 
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from rich.console import Console
 
 from config import (
@@ -15,10 +16,16 @@ from config import (
     FONTS_DIR,
     get_ffmpeg_binary,
 )
-from pipeline_utils import is_stale, run_cmd
+from pipeline_utils import CacheManifest, RunStats, fingerprint, run_cmd
 from script_engine import VideoProjectSchema
 
 console = Console()
+
+# Ajustes del codificador (forman parte de las huellas de clips y video final)
+CLIP_PRESET = "veryfast"
+FINAL_PRESET = "medium"
+FINAL_AUDIO_BITRATE = "192k"
+LOUDNORM_FILTER = "loudnorm=I=-14:TP=-1.5:LRA=11"
 
 
 def build_zoompan_filter(
@@ -66,20 +73,28 @@ def render_scene_clip(
     output_clip_path: Path,
     duration_sec: float,
     camera_effect: str,
+    manifest: CacheManifest,
     force: bool = False,
-    extra_inputs: tuple[Path, ...] = (),
-) -> Path:
-    """Render a single scene image into an animated MP4 clip matching audio duration."""
-    if (
-        output_clip_path.exists()
-        and output_clip_path.stat().st_size > 1000
-        and not force
-        and not is_stale(output_clip_path, image_path, *extra_inputs)
-    ):
-        return output_clip_path
+) -> bool:
+    """Render one scene image into an animated MP4 clip. Returns True if rendered, False on cache hit."""
+    vf_filter = build_zoompan_filter(camera_effect, duration_sec, VIDEO_FPS)
+    fp = fingerprint(
+        kind="clip",
+        image=image_path,
+        duration=f"{duration_sec:.3f}",
+        filter=vf_filter,
+        effect=camera_effect,
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=VIDEO_FPS,
+        preset=CLIP_PRESET,
+        pix_fmt=VIDEO_PIX_FMT,
+    )
+    if not force and manifest.is_fresh(output_clip_path, fp) and output_clip_path.stat().st_size > 1000:
+        return False
 
     ffmpeg_bin = get_ffmpeg_binary()
-    vf_filter = build_zoompan_filter(camera_effect, duration_sec, VIDEO_FPS)
+    part_path = output_clip_path.with_name(output_clip_path.stem + ".part.mp4")
 
     cmd = [
         ffmpeg_bin,
@@ -95,32 +110,37 @@ def render_scene_clip(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        CLIP_PRESET,
         "-pix_fmt",
         VIDEO_PIX_FMT,
         "-r",
         str(VIDEO_FPS),
         "-an",
-        str(output_clip_path),
+        str(part_path),
     ]
 
     run_cmd(cmd, f"Render del clip {output_clip_path.name}")
-    return output_clip_path
+    os.replace(part_path, output_clip_path)
+    manifest.record(output_clip_path, fp)
+    return True
 
 
 def render_all_scene_clips(
     timing_metadata: dict[str, Any],
     images_dir: Path,
     clips_dir: Path,
+    manifest: CacheManifest,
     force: bool = False,
+    stats: Optional[RunStats] = None,
 ) -> list[Path]:
-    """Render all scene video clips."""
+    """Render all scene video clips (per-clip cache by image hash + duration + effect)."""
     clips_dir.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
-    metadata_path = images_dir.parent / "audio" / "timing_metadata.json"
+    rendered = 0
+    cached_count = 0
 
     scenes = timing_metadata.get("scenes", [])
-    console.print(f"[cyan]Renderizando {len(scenes)} clips de video dinámicos a {VIDEO_FPS} fps...[/cyan]")
+    console.print(f"[cyan]Clips de video dinámicos a {VIDEO_FPS} fps para {len(scenes)} escenas...[/cyan]")
 
     for scene in scenes:
         scene_id = scene["scene_id"]
@@ -130,17 +150,25 @@ def render_all_scene_clips(
         img_path = images_dir / f"scene_{scene_id:02d}.png"
         clip_path = clips_dir / f"clip_{scene_id:02d}.mp4"
 
-        render_scene_clip(
+        did_render = render_scene_clip(
             image_path=img_path,
             output_clip_path=clip_path,
             duration_sec=duration_sec,
             camera_effect=camera_effect,
+            manifest=manifest,
             force=force,
-            extra_inputs=(metadata_path,),
         )
         clips.append(clip_path)
-        console.print(f"  [green]✓ Clip {scene_id:02d} renderizado ({duration_sec:.2f}s, {camera_effect})[/green]")
+        if did_render:
+            rendered += 1
+            if stats is not None:
+                stats.clips.append(scene_id)
+            console.print(f"  [green]✓ Clip {scene_id:02d} renderizado ({duration_sec:.2f}s, {camera_effect})[/green]")
+        else:
+            cached_count += 1
+            console.print(f"  [green]✓ Clip {scene_id:02d} en caché ({duration_sec:.2f}s, {camera_effect})[/green]")
 
+    console.print(f"[bold green]✓ Clips: {rendered} renderizados, {cached_count} en caché.[/bold green]")
     return clips
 
 
@@ -152,20 +180,34 @@ def assemble_final_video(
     bgm_path: Path,
     whoosh_path: Path,
     output_final_path: Path,
+    manifest: CacheManifest,
     force: bool = False,
+    stats: Optional[RunStats] = None,
 ) -> Path:
     """Concatenate clips, mix audio tracks (voice, whoosh SFX, BGM), and burn subtitles."""
-    final_inputs = [
-        workspace_dir / "clips" / f"clip_{sc['scene_id']:02d}.mp4" for sc in timing_metadata.get("scenes", [])
-    ]
-    final_inputs += [subtitles_ass_path, workspace_dir / "audio" / "timing_metadata.json"]
-    if (
-        output_final_path.exists()
-        and output_final_path.stat().st_size > 10_000
-        and not force
-        and not is_stale(output_final_path, *final_inputs)
-    ):
-        console.print(f"[green]✓ Video final existente en caché:[/] {output_final_path}")
+    scene_list = timing_metadata.get("scenes", [])
+    clip_inputs = [workspace_dir / "clips" / f"clip_{sc['scene_id']:02d}.mp4" for sc in scene_list]
+    voice_inputs = [workspace_dir / "audio" / sc["audio_file"] for sc in scene_list]
+    fp = fingerprint(
+        kind="final",
+        clips=clip_inputs,
+        voices=voice_inputs,
+        subtitles=subtitles_ass_path,
+        bgm=bgm_path,
+        sfx=whoosh_path,
+        sfx_volume=SFX_VOLUME,
+        bgm_volume=BGM_VOLUME,
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=VIDEO_FPS,
+        crf=VIDEO_CRF,
+        preset=FINAL_PRESET,
+        pix_fmt=VIDEO_PIX_FMT,
+        audio_bitrate=FINAL_AUDIO_BITRATE,
+        loudnorm=LOUDNORM_FILTER,
+    )
+    if not force and manifest.is_fresh(output_final_path, fp) and output_final_path.stat().st_size > 10_000:
+        console.print(f"[green]✓ Video final en caché:[/] {output_final_path}")
         return output_final_path
 
     ffmpeg_bin = get_ffmpeg_binary()
@@ -262,9 +304,9 @@ def assemble_final_video(
             filter_complex_parts.append(f"[w{i}]adelay={delay_ms}|{delay_ms}[dw{i}]")
         sfx_inputs = "".join(f"[dw{i}]" for i in range(num_trans))
         filter_complex_parts.append(f"{sfx_inputs}amix=inputs={num_trans}:dropout_transition=0:normalize=0[all_sfx]")
-        filter_complex_parts.append("[voice][bgm][all_sfx]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
+        filter_complex_parts.append(f"[voice][bgm][all_sfx]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,{LOUDNORM_FILTER}[aout]")
     else:
-        filter_complex_parts.append("[voice][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
+        filter_complex_parts.append(f"[voice][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,{LOUDNORM_FILTER}[aout]")
 
     # Subtitles video filter in filter_complex
     escaped_ass = str(subtitles_ass_path).replace("\\", "/").replace(":", "\\:")
@@ -273,6 +315,7 @@ def assemble_final_video(
 
     filter_complex_str = ";".join(filter_complex_parts)
 
+    part_final_path = output_final_path.with_name(output_final_path.stem + ".part.mp4")
     cmd_final = [
         ffmpeg_bin,
         "-y",
@@ -299,20 +342,24 @@ def assemble_final_video(
         "-crf",
         str(VIDEO_CRF),
         "-preset",
-        "medium",
+        FINAL_PRESET,
         "-pix_fmt",
         VIDEO_PIX_FMT,
         "-c:a",
         "aac",
         "-b:a",
-        "192k",
+        FINAL_AUDIO_BITRATE,
         "-shortest",
         "-movflags",
         "+faststart",
-        str(output_final_path),
+        str(part_final_path),
     ])
 
     run_cmd(cmd_final, "Render final (mezcla de audio y subtítulos)")
+    os.replace(part_final_path, output_final_path)
+    manifest.record(output_final_path, fp)
+    if stats is not None:
+        stats.final = True
     console.print(f"[bold green]✓ Video final exportado exitosamente:[/] {output_final_path}")
 
     # Generate post metadata

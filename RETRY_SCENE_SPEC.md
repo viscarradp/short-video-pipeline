@@ -1,3 +1,11 @@
+> **Estado: implementado.** Comando real:
+> `python main.py retry-scene --slug X --scene N [--scene M ...] [--prompt "..."] [--narration "..."] [--seed INT]`
+> - `--scene` repetible; `--prompt`/`--narration` solo con una única escena y se persisten en `script.json`.
+> - Se re-genera la imagen de cada escena indicada salvo que solo se pase `--narration` (el clip se rehace igualmente porque cambia la duración).
+> - Usa `run_config.json` del proyecto (opciones de `generate`) y el caché por huella de contenido: solo se rehacen el audio, imagen y clip afectados y el video final.
+> - Al final imprime el resumen y el costo estimado de Fal.ai (imágenes Flux reales × $0.003; $0 en mock).
+> - Difiere del diseño original de abajo: no existe `regenerate_single_scene_image()`; la lógica pasa por `run_pipeline()` con huellas de contenido.
+
 # 🔄 Propuesta de Feature: Regeneración Quirúrgica de Escena (`retry-scene`)
 
 Documento técnico que detalla la viabilidad, arquitectura y pasos de implementación para regenerar una sola foto/frame y reensamblar el video final sin regenerar el resto del proyecto.

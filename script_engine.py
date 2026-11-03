@@ -12,7 +12,7 @@ from rich.console import Console
 
 import fal_client
 from config import FAL_KEY
-from pipeline_utils import PipelineError
+from pipeline_utils import CacheManifest, PipelineError, RunStats, fingerprint
 from profiles import VideoProfile, get_profile
 
 console = Console()
@@ -313,6 +313,19 @@ def _word_tokens(text: str) -> list[str]:
     return [t for t in tokens if t]
 
 
+def light_normalize_project(project: VideoProjectSchema, profile: VideoProfile) -> bool:
+    """Normalización ligera (también para guiones en caché o editados a mano): sin validar el nº de escenas.
+
+    Renumera scene_id 1..N y fuerza perfil y estilo visual global. Devuelve True si algo cambió.
+    """
+    before = project.model_dump()
+    project.profile = profile.name
+    project.global_visual_style = profile.global_visual_style
+    for idx, scene in enumerate(project.scenes, start=1):
+        scene.scene_id = idx
+    return project.model_dump() != before
+
+
 def normalize_project(project: VideoProjectSchema, profile: VideoProfile) -> VideoProjectSchema:
     """Normalize an LLM-produced project in place; raise ValueError if scene count is out of bounds."""
     n_scenes = len(project.scenes)
@@ -322,11 +335,9 @@ def normalize_project(project: VideoProjectSchema, profile: VideoProfile) -> Vid
             f"{profile.target_scenes_min} y {profile.target_scenes_max}."
         )
 
-    project.profile = profile.name
-    project.global_visual_style = profile.global_visual_style
+    light_normalize_project(project, profile)
 
-    for idx, scene in enumerate(project.scenes, start=1):
-        scene.scene_id = idx
+    for scene in project.scenes:
         narration_tokens = set(_word_tokens(scene.narration_es))
         kept: list[str] = []
         for hw in scene.highlight_words:
@@ -343,36 +354,71 @@ def _write_script(project: VideoProjectSchema, script_path: Path) -> None:
         f.write(project.model_dump_json(indent=2))
 
 
+def write_script(project: VideoProjectSchema, script_path: Path) -> None:
+    """Escribe script.json (formato canónico del pipeline)."""
+    _write_script(project, script_path)
+
+
 def generate_or_load_script(
     topic: str,
     profile_name: str,
     output_dir: Path,
+    manifest: CacheManifest,
     force: bool = False,
     mock_script: bool = False,
+    stats: Optional[RunStats] = None,
 ) -> VideoProjectSchema:
-    """Load cached script or generate a new one via Fal.ai any-llm (never silently falls back to mock)."""
-    script_path = output_dir / "script.json"
-    mock_marker = output_dir / "script.mock"
+    """Carga el guion en caché (respetando ediciones manuales) o lo genera con Fal.ai any-llm.
 
-    # Idempotency / Cache Check (a mock script is never a valid cache entry for a real run)
-    if script_path.exists() and not force and not mock_script and mock_marker.exists():
-        console.print("[yellow]Aviso: el script.json en caché es de demostración (--mock-script); se regenerará con el LLM.[/yellow]")
-    elif script_path.exists() and not force:
-        try:
-            with open(script_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            project = VideoProjectSchema.model_validate(data)
-            console.print(f"[green]✓ Reutilizando guion en caché:[/] {script_path}")
-            return project
-        except Exception as e:
-            console.print(f"[yellow]Aviso: script.json existente no es válido ({e}). Regenerando...[/yellow]")
+    Huella: tema + perfil + flag mock. Nunca cae silenciosamente a mock.
+    """
+    script_path = output_dir / "script.json"
+    legacy_mock_marker = output_dir / "script.mock"  # marcador de Fase 1, reemplazado por el manifiesto
 
     profile = get_profile(profile_name)
+    fp = fingerprint(kind="script", topic=topic, profile=profile.name, mock_script=mock_script)
+
+    if script_path.exists() and not force:
+        recorded = manifest.get(script_path)
+        if recorded is None:
+            # Migración: workspace de Fase 1 sin entrada en el manifiesto.
+            legacy_is_mock = legacy_mock_marker.exists()
+            if legacy_is_mock == mock_script:
+                manifest.record(script_path, fp)
+                recorded = fp
+                console.print("  [dim]Guion existente adoptado en el manifiesto de caché (workspace anterior).[/dim]")
+            elif legacy_is_mock:
+                console.print("[yellow]Aviso: el script.json existente es de demostración (--mock-script); se regenerará con el LLM.[/yellow]")
+            else:
+                console.print("[yellow]Aviso: el script.json existente no es de demostración; se regenerará como guion --mock-script.[/yellow]")
+        if recorded == fp:
+            try:
+                with open(script_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                project = VideoProjectSchema.model_validate(data)
+                if light_normalize_project(project, profile):
+                    _write_script(project, script_path)
+                    console.print("  [dim]script.json normalizado (ids de escena / perfil / estilo global) y reescrito.[/dim]")
+                if legacy_mock_marker.exists():
+                    legacy_mock_marker.unlink()
+                console.print(f"[green]✓ Guion en caché:[/] {script_path} ({len(project.scenes)} escenas)")
+                return project
+            except Exception as e:
+                console.print(f"[yellow]Aviso: script.json existente no es válido ({e}). Regenerando...[/yellow]")
+        elif recorded is not None:
+            console.print("[yellow]Aviso: cambió el tema, el perfil o el modo del guion; se regenerará.[/yellow]")
+
+    def _persist(project: VideoProjectSchema) -> None:
+        _write_script(project, script_path)
+        manifest.record(script_path, fp)
+        if legacy_mock_marker.exists():
+            legacy_mock_marker.unlink()
+        if stats is not None:
+            stats.script = True
 
     if mock_script:
         project = generate_mock_script(topic, profile)
-        _write_script(project, script_path)
-        mock_marker.touch()
+        _persist(project)
         return project
 
     # Set FAL_KEY in os.environ for fal_client if configured
@@ -419,9 +465,7 @@ def generate_or_load_script(
             project = normalize_project(project, profile)
 
             # Persist script only once a valid, normalized project exists
-            _write_script(project, script_path)
-            if mock_marker.exists():
-                mock_marker.unlink()
+            _persist(project)
 
             console.print(f"[green]✓ Guión generado y validado con Pydantic ({len(project.scenes)} escenas).[/green]")
             return project

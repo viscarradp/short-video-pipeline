@@ -164,7 +164,7 @@ def generate_subtitles_ass(
 
     full_ass_content = header + "\n".join(dialogue_lines) + "\n"
 
-    # Only rewrite when content changed so the mtime (used for downstream staleness) advances on real change
+    # Only rewrite when content changed (cheap to regenerate; the final-video fingerprint hashes the .ass)
     try:
         unchanged = output_ass_path.exists() and output_ass_path.read_text(encoding="utf-8") == full_ass_content
     except Exception:

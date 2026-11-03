@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 from rich.console import Console
 
 import edge_tts
 from config import get_ffprobe_binary
-from pipeline_utils import is_stale, run_cmd
+from pipeline_utils import CacheManifest, RunStats, fingerprint, run_cmd
 from profiles import VideoProfile
 from script_engine import VideoProjectSchema
 
@@ -92,9 +93,11 @@ async def generate_single_scene_audio(
                         })
 
             if audio_data:
-                # Save audio file
-                with open(output_mp3, "wb") as f:
+                # Save audio file atomically (a crash never leaves a half-written mp3)
+                tmp_mp3 = output_mp3.with_name(output_mp3.name + ".part")
+                with open(tmp_mp3, "wb") as f:
                     f.write(audio_data)
+                os.replace(tmp_mp3, output_mp3)
                 return words
             else:
                 raise RuntimeError("No se recibieron bytes de audio")
@@ -111,57 +114,46 @@ async def generate_all_scene_audios(
     project: VideoProjectSchema,
     profile: VideoProfile,
     output_dir: Path,
+    manifest: CacheManifest,
     voice_override: Optional[str] = None,
     force: bool = False,
+    stats: Optional[RunStats] = None,
 ) -> dict[str, Any]:
-    """Generate all scene audio files with word boundary metadata and caching."""
+    """Generate scene audio files with word boundary metadata; cached per scene by content fingerprint."""
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = audio_dir / "timing_metadata.json"
-    script_path = output_dir / "script.json"
 
     voice = voice_override if voice_override else profile.default_voice
     rate = profile.voice_rate
 
-    # Check cache
-    if metadata_path.exists() and not force and not is_stale(metadata_path, script_path):
-        try:
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                cached_data = json.load(f)
-            # Verify all scene files exist
-            all_exist = True
-            for scene_meta in cached_data.get("scenes", []):
-                scene_audio = audio_dir / scene_meta["audio_file"]
-                if not scene_audio.exists() or scene_audio.stat().st_size == 0:
-                    all_exist = False
-                    break
-            if all_exist and len(cached_data.get("scenes", [])) == len(project.scenes):
-                console.print(f"[green]✓ Reutilizando audios y timing en caché:[/] {audio_dir}")
-                return cached_data
-        except Exception:
-            pass
-
-    console.print(f"[cyan]Sintetizando locución para {len(project.scenes)} escenas con edge-tts ({voice}, {rate})...[/cyan]")
+    console.print(f"[cyan]Locución para {len(project.scenes)} escenas con edge-tts ({voice}, {rate})...[/cyan]")
 
     scenes_timing: list[dict[str, Any]] = []
     total_duration = 0.0
+    generated = 0
+    cached_count = 0
 
     for scene in project.scenes:
         audio_filename = f"scene_{scene.scene_id:02d}.mp3"
         audio_path = audio_dir / audio_filename
-
         words_path = audio_dir / f"scene_{scene.scene_id:02d}.words.json"
 
-        # Individual cache check
+        # Huella por escena: texto de la narración + voz + velocidad
+        fp = fingerprint(kind="audio", text=scene.narration_es, voice=voice, rate=rate)
+
         words: list[dict[str, Any]] = []
-        cached = False
-        if audio_path.exists() and audio_path.stat().st_size > 500 and not force and not is_stale(audio_path, script_path):
-            words = load_words_sidecar(words_path)
-            if words:
-                cached = True
+        cached = (
+            not force
+            and manifest.is_fresh(audio_path, fp)
+            and audio_path.stat().st_size > 500
+            and words_path.exists()
+        )
 
         if cached:
+            words = load_words_sidecar(words_path)
             real_duration = get_audio_duration_seconds(audio_path)
+            cached_count += 1
             console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Audio en caché ({real_duration:.2f}s, {len(words)} palabras)[/green]")
         else:
             words = await generate_single_scene_audio(
@@ -172,8 +164,12 @@ async def generate_all_scene_audios(
             )
             with open(words_path, "w", encoding="utf-8") as f:
                 json.dump(words, f, indent=2, ensure_ascii=False)
+            manifest.record(audio_path, fp)
             real_duration = get_audio_duration_seconds(audio_path)
-            console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Generado ({real_duration:.2f}s, {len(words)} palabras)[/green]")
+            generated += 1
+            if stats is not None:
+                stats.audio.append(scene.scene_id)
+            console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Audio generado ({real_duration:.2f}s, {len(words)} palabras)[/green]")
             if not words and scene.narration_es.strip():
                 console.print(
                     f"  [bold yellow]⚠ Escena {scene.scene_id:02d}: edge-tts no devolvió tiempos por palabra. "
@@ -200,7 +196,7 @@ async def generate_all_scene_audios(
         "scenes": scenes_timing,
     }
 
-    # Only rewrite when content changed so the mtime (used for downstream staleness) advances on real change
+    # Barato de regenerar: se reescribe solo si el contenido cambió
     serialized = json.dumps(timing_metadata, indent=2, ensure_ascii=False)
     try:
         unchanged = metadata_path.exists() and metadata_path.read_text(encoding="utf-8") == serialized
@@ -209,7 +205,10 @@ async def generate_all_scene_audios(
     if not unchanged:
         metadata_path.write_text(serialized, encoding="utf-8")
 
-    console.print(f"[bold green]✓ Todos los audios generados. Duración total: {total_duration:.2f} segundos.[/bold green]")
+    console.print(
+        f"[bold green]✓ Audio: {generated} generados, {cached_count} en caché. "
+        f"Duración total: {total_duration:.2f} segundos.[/bold green]"
+    )
     return timing_metadata
 
 
@@ -217,8 +216,10 @@ def generate_tts_sync(
     project: VideoProjectSchema,
     profile: VideoProfile,
     output_dir: Path,
+    manifest: CacheManifest,
     voice_override: Optional[str] = None,
     force: bool = False,
+    stats: Optional[RunStats] = None,
 ) -> dict[str, Any]:
     """Synchronous wrapper for generate_all_scene_audios."""
     return asyncio.run(
@@ -226,7 +227,9 @@ def generate_tts_sync(
             project=project,
             profile=profile,
             output_dir=output_dir,
+            manifest=manifest,
             voice_override=voice_override,
             force=force,
+            stats=stats,
         )
     )
