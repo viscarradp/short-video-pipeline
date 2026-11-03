@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from config import AUDIO_SAMPLE_RATE, SAMPLES_PER_FRAME, VIDEO_FPS
+
 # Se incluye en TODA huella: súbelo cuando cambie el formato de los artefactos para invalidar la caché completa.
 CACHE_VERSION = 1
 
@@ -145,4 +147,32 @@ class RunStats:
     audio: list[int] = field(default_factory=list)
     images: list[int] = field(default_factory=list)
     clips: list[int] = field(default_factory=list)
+    mix: bool = False
     final: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Línea de tiempo exacta (fotogramas <-> muestras de audio)
+# --------------------------------------------------------------------------- #
+
+def frames_for_samples(samples: int, sample_rate: int = AUDIO_SAMPLE_RATE, fps: int = VIDEO_FPS) -> int:
+    """Fotogramas de video que cubren `samples` muestras de audio: ceil(samples * fps / sample_rate), mínimo 1."""
+    return max(-(-samples * fps // sample_rate), 1)
+
+
+def scene_frames(scene: dict[str, Any], fps: int = VIDEO_FPS) -> int:
+    """Nº de fotogramas de una escena del timing_metadata (con respaldo desde duration_sec)."""
+    frames = scene.get("frames")
+    if frames:
+        return int(frames)
+    return max(round(float(scene.get("duration_sec", 3.0)) * fps), 1)
+
+
+def scene_start_frames(scenes: list[dict[str, Any]], fps: int = VIDEO_FPS) -> list[int]:
+    """Fotograma de inicio acumulado de cada escena."""
+    starts: list[int] = []
+    acc = 0
+    for sc in scenes:
+        starts.append(acc)
+        acc += scene_frames(sc, fps)
+    return starts

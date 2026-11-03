@@ -7,10 +7,16 @@ from typing import Any
 from rich.console import Console
 
 from config import (
+    VIDEO_FPS,
     VIDEO_WIDTH,
     VIDEO_HEIGHT,
     SUBTITLE_FONT_NAME,
+    SUBTITLE_FONT_BOLD,
 )
+from pipeline_utils import scene_frames
+
+MIN_CHUNK_MS = 350  # visibilidad mínima de un bloque (se recorta si chocaría con el siguiente)
+CHUNK_GAP_MS = 10  # 1 cs de separación entre un bloque y el siguiente
 
 console = Console()
 
@@ -36,7 +42,7 @@ def sanitize_ass_text(text: str) -> str:
     return text.replace("{", "(").replace("}", ")").replace("\\", "/")
 
 
-def build_ass_header(font_name: str = SUBTITLE_FONT_NAME) -> str:
+def build_ass_header(font_name: str = SUBTITLE_FONT_NAME, bold: int = SUBTITLE_FONT_BOLD) -> str:
     """Generate ASS script header with 1080x1920 resolution and viral style."""
     return f"""[Script Info]
 Title: TikTok Viral Dynamic Subtitles
@@ -49,7 +55,7 @@ PlayResY: {VIDEO_HEIGHT}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralTikTok,{font_name},72,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,2,0,1,6,3,2,60,60,620,1
+Style: ViralTikTok,{font_name},72,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,2,0,1,6,3,2,60,60,620,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -82,6 +88,18 @@ def chunk_words(words: list[dict[str, Any]], max_chunk_size: int = 3) -> list[li
     return chunks
 
 
+def clamp_chunk_ends(events: list[dict[str, Any]], timeline_end_ms: int) -> None:
+    """Recorta in situ el fin de cada bloque al inicio del siguiente (menos 1 cs) y al final de la línea de tiempo.
+
+    Evita que dos líneas se apilen en pantalla cuando el mínimo de 350 ms alargó un bloque. Cada evento es un dict
+    con start_ms/end_ms en la línea de tiempo continua; se asume ordenado por inicio. Nunca deja un bloque con
+    duración menor a 1 cs.
+    """
+    for idx, ev in enumerate(events):
+        limit = events[idx + 1]["start_ms"] - CHUNK_GAP_MS if idx + 1 < len(events) else timeline_end_ms
+        ev["end_ms"] = max(min(ev["end_ms"], limit), ev["start_ms"] + CHUNK_GAP_MS)
+
+
 def generate_subtitles_ass(
     timing_metadata: dict[str, Any],
     output_ass_path: Path,
@@ -91,12 +109,15 @@ def generate_subtitles_ass(
     console.print("[cyan]Generando subtítulos dinámicos estilo TikTok (.ass)...[/cyan]")
 
     header = build_ass_header(font_name=font_name)
-    dialogue_lines: list[str] = []
+    events: list[dict[str, Any]] = []
+    fps = timing_metadata.get("fps", VIDEO_FPS)
 
-    cumulative_offset_ms = 0
+    cumulative_frames = 0
 
     for scene in timing_metadata.get("scenes", []):
-        scene_duration_ms = round(scene.get("duration_sec", 3.0) * 1000)
+        frames = scene_frames(scene, fps)
+        scene_duration_ms = round(frames * 1000 / fps)
+        cumulative_offset_ms = round(cumulative_frames * 1000 / fps)  # sin acumular redondeos
         raw_words = scene.get("words", [])
         highlight_keywords = {
             clean_word_for_matching(w) for w in scene.get("highlight_words", [])
@@ -128,12 +149,9 @@ def generate_subtitles_ass(
             chunk_start_ms = cumulative_offset_ms + chunk[0]["start_ms"]
             chunk_end_ms = cumulative_offset_ms + chunk[-1]["end_ms"]
 
-            # Ensure minimum visibility duration of 350ms
-            if chunk_end_ms - chunk_start_ms < 350:
-                chunk_end_ms = chunk_start_ms + 350
-
-            start_ass = ms_to_ass_time(chunk_start_ms)
-            end_ass = ms_to_ass_time(chunk_end_ms)
+            # Ensure minimum visibility duration (clamp_chunk_ends later trims overlaps with the next chunk)
+            if chunk_end_ms - chunk_start_ms < MIN_CHUNK_MS:
+                chunk_end_ms = chunk_start_ms + MIN_CHUNK_MS
 
             # Format words inside chunk with uppercase and keyword highlighting
             formatted_words = []
@@ -156,11 +174,16 @@ def generate_subtitles_ass(
             animation_tag = r"{\fscx120\fscy120\t(0,65,\fscx100\fscy100)}"
             dialogue_text = f"{animation_tag}{text_content}"
 
-            line = f"Dialogue: 0,{start_ass},{end_ass},ViralTikTok,,0,0,0,,{dialogue_text}"
-            dialogue_lines.append(line)
+            events.append({"start_ms": chunk_start_ms, "end_ms": chunk_end_ms, "text": dialogue_text})
 
-        # Advance continuous cumulative timeline by exact scene duration
-        cumulative_offset_ms += scene_duration_ms
+        # Advance continuous cumulative timeline by exact (frame-based) scene duration
+        cumulative_frames += frames
+
+    clamp_chunk_ends(events, round(cumulative_frames * 1000 / fps))
+    dialogue_lines = [
+        f"Dialogue: 0,{ms_to_ass_time(ev['start_ms'])},{ms_to_ass_time(ev['end_ms'])},ViralTikTok,,0,0,0,,{ev['text']}"
+        for ev in events
+    ]
 
     full_ass_content = header + "\n".join(dialogue_lines) + "\n"
 

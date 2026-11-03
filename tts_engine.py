@@ -3,13 +3,14 @@
 import asyncio
 import json
 import os
+import wave
 from pathlib import Path
 from typing import Any, Optional
 from rich.console import Console
 
 import edge_tts
-from config import get_ffprobe_binary
-from pipeline_utils import CacheManifest, RunStats, fingerprint, run_cmd
+from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, SAMPLES_PER_FRAME, VIDEO_FPS, get_ffmpeg_binary, get_ffprobe_binary
+from pipeline_utils import CacheManifest, PipelineError, RunStats, fingerprint, frames_for_samples, run_cmd
 from profiles import VideoProfile
 from script_engine import VideoProjectSchema
 
@@ -31,6 +32,49 @@ def get_audio_duration_seconds(audio_path: Path) -> float:
     ]
     res = run_cmd(cmd, f"ffprobe de {audio_path.name}")
     return float(res.stdout.strip())
+
+
+def wav_frame_count(wav_path: Path) -> int:
+    """Fotogramas de video de un wav por escena, leídos de su cabecera (muestras reales, no metadatos del mp3)."""
+    with wave.open(str(wav_path), "rb") as wf:
+        samples = wf.getnframes()
+    if samples % SAMPLES_PER_FRAME != 0:
+        raise PipelineError(f"{wav_path.name} no es múltiplo exacto de fotogramas ({samples} muestras).")
+    return samples // SAMPLES_PER_FRAME
+
+
+def make_frame_exact_wav(mp3_path: Path, wav_path: Path) -> int:
+    """Decodifica el mp3 a PCM s16le (48 kHz estéreo), mide las muestras DECODIFICADAS y rellena con silencio
+    hasta un número entero de fotogramas. Devuelve los fotogramas. Escritura atómica."""
+    dec_path = wav_path.with_name(wav_path.stem + ".dec.wav")
+    part_path = wav_path.with_name(wav_path.stem + ".part.wav")
+    try:
+        run_cmd(
+            [
+                get_ffmpeg_binary(), "-y", "-i", str(mp3_path),
+                "-vn", "-c:a", "pcm_s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
+                str(dec_path),
+            ],
+            f"Decodificación de {mp3_path.name} a wav",
+        )
+        with wave.open(str(dec_path), "rb") as wf:
+            if (wf.getframerate(), wf.getnchannels(), wf.getsampwidth()) != (AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, 2):
+                raise PipelineError(f"{dec_path.name}: formato inesperado tras decodificar.")
+            decoded_samples = wf.getnframes()
+            pcm = wf.readframes(decoded_samples)
+        frames = frames_for_samples(decoded_samples)
+        pad_samples = frames * SAMPLES_PER_FRAME - decoded_samples
+        with wave.open(str(part_path), "wb") as out:
+            out.setnchannels(AUDIO_CHANNELS)
+            out.setsampwidth(2)
+            out.setframerate(AUDIO_SAMPLE_RATE)
+            out.writeframes(pcm + bytes(pad_samples * AUDIO_CHANNELS * 2))
+        os.replace(part_path, wav_path)
+        return frames
+    finally:
+        for leftover in (dec_path, part_path):
+            if leftover.exists():
+                leftover.unlink()
 
 
 def load_words_sidecar(words_path: Path) -> list[dict[str, Any]]:
@@ -130,7 +174,7 @@ async def generate_all_scene_audios(
     console.print(f"[cyan]Locución para {len(project.scenes)} escenas con edge-tts ({voice}, {rate})...[/cyan]")
 
     scenes_timing: list[dict[str, Any]] = []
-    total_duration = 0.0
+    total_frames = 0
     generated = 0
     cached_count = 0
 
@@ -152,9 +196,7 @@ async def generate_all_scene_audios(
 
         if cached:
             words = load_words_sidecar(words_path)
-            real_duration = get_audio_duration_seconds(audio_path)
             cached_count += 1
-            console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Audio en caché ({real_duration:.2f}s, {len(words)} palabras)[/green]")
         else:
             words = await generate_single_scene_audio(
                 text=scene.narration_es,
@@ -165,11 +207,29 @@ async def generate_all_scene_audios(
             with open(words_path, "w", encoding="utf-8") as f:
                 json.dump(words, f, indent=2, ensure_ascii=False)
             manifest.record(audio_path, fp)
-            real_duration = get_audio_duration_seconds(audio_path)
             generated += 1
             if stats is not None:
                 stats.audio.append(scene.scene_id)
-            console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Audio generado ({real_duration:.2f}s, {len(words)} palabras)[/green]")
+
+        # wav exacto por fotogramas: derivado del mp3 (huella = hash del mp3 + frecuencia + canales + fps)
+        wav_filename = f"scene_{scene.scene_id:02d}.wav"
+        wav_path = audio_dir / wav_filename
+        wav_fp = fingerprint(
+            kind="scene_wav", mp3=audio_path, sample_rate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS, fps=VIDEO_FPS,
+        )
+        if not force and manifest.is_fresh(wav_path, wav_fp) and wav_path.stat().st_size > 44:
+            frames = wav_frame_count(wav_path)
+        else:
+            frames = make_frame_exact_wav(audio_path, wav_path)
+            manifest.record(wav_path, wav_fp)
+        real_duration = frames / VIDEO_FPS
+
+        status = "en caché" if cached else "generado"
+        console.print(
+            f"  [green]✓ Escena {scene.scene_id:02d}: Audio {status} "
+            f"({real_duration:.3f}s = {frames} fotogramas, {len(words)} palabras)[/green]"
+        )
+        if not cached:
             if not words and scene.narration_es.strip():
                 console.print(
                     f"  [bold yellow]⚠ Escena {scene.scene_id:02d}: edge-tts no devolvió tiempos por palabra. "
@@ -181,18 +241,24 @@ async def generate_all_scene_audios(
             "scene_id": scene.scene_id,
             "narration_es": scene.narration_es,
             "audio_file": audio_filename,
+            "wav_file": wav_filename,
+            "frames": frames,
             "duration_sec": real_duration,
             "camera_effect": scene.camera_effect,
             "highlight_words": scene.highlight_words,
             "words": words,
         })
-        total_duration += real_duration
+        total_frames += frames
 
+    total_duration = total_frames / VIDEO_FPS
     timing_metadata = {
         "voice": voice,
         "rate": rate,
+        "fps": VIDEO_FPS,
+        "sample_rate": AUDIO_SAMPLE_RATE,
         "total_scenes": len(project.scenes),
-        "total_duration_sec": round(total_duration, 2),
+        "total_frames": total_frames,
+        "total_duration_sec": total_duration,
         "scenes": scenes_timing,
     }
 
@@ -207,7 +273,7 @@ async def generate_all_scene_audios(
 
     console.print(
         f"[bold green]✓ Audio: {generated} generados, {cached_count} en caché. "
-        f"Duración total: {total_duration:.2f} segundos.[/bold green]"
+        f"Duración total: {total_duration:.3f} s ({total_frames} fotogramas).[/bold green]"
     )
     return timing_metadata
 

@@ -27,7 +27,9 @@ Herramienta CLI modular y profesional en Python para automatizar el 100% de la c
 7. **Ensamblado FFmpeg con Zero-Jitter:**
    - Movimiento de cámara Ken Burns suave (`zoom_in_fast`, `zoom_in_slow`, `zoom_out`, `pan_right`, `pan_left`) con supersampling.
    - Efecto de sonido `whoosh` en cada corte de escena a `volume=0.18`.
-   - Música ambiental sutil a `volume=0.10` con fade-out al final.
+   - Música de fondo con *ducking*: baja automáticamente bajo la voz (`sidechaincompress`) y sube en las pausas, con fade-out al final.
+   - Mezcla de audio como etapa propia (`audio/mix_final.wav`) normalizada a **-14 LUFS** con `loudnorm` de dos pasadas (techo -1.5 dBTP).
+   - Línea de tiempo exacta por fotogramas: cada escena dura un número entero de fotogramas y su audio un número entero de muestras (1 fotograma = 1600 muestras a 48 kHz), así cortes, whooshes y subtítulos no se desfasan.
    - Generación de `post_metadata.txt` con título, descripción y hashtags.
 
 ---
@@ -97,7 +99,7 @@ python main.py generate --profile micronovela --topic "Mi hermano hipotecó la c
 - `--force-script`: Regenerar solo el guion. Ojo: un guion nuevo suele traer prompts nuevos, es decir, **volver a pagar las imágenes**.
 - `--force-audio`: Regenerar solo la locución.
 - `--force-images`: Regenerar solo las imágenes (consume créditos sin `--mock-images`).
-- `--force-video`: Re-renderizar solo clips y video final.
+- `--force-video`: Re-renderizar solo clips, mezcla de audio y video final.
 
 Cada ejecución guarda sus opciones en `workspace/<slug>/run_config.json`.
 

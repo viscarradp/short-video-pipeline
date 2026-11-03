@@ -11,12 +11,10 @@ from config import (
     VIDEO_FPS,
     VIDEO_CRF,
     VIDEO_PIX_FMT,
-    SFX_VOLUME,
-    BGM_VOLUME,
     FONTS_DIR,
     get_ffmpeg_binary,
 )
-from pipeline_utils import CacheManifest, RunStats, fingerprint, run_cmd
+from pipeline_utils import CacheManifest, RunStats, fingerprint, run_cmd, scene_frames
 from script_engine import VideoProjectSchema
 
 console = Console()
@@ -25,16 +23,15 @@ console = Console()
 CLIP_PRESET = "veryfast"
 FINAL_PRESET = "medium"
 FINAL_AUDIO_BITRATE = "192k"
-LOUDNORM_FILTER = "loudnorm=I=-14:TP=-1.5:LRA=11"
 
 
 def build_zoompan_filter(
     camera_effect: str,
-    duration_sec: float,
+    frames: int,
     fps: int = VIDEO_FPS,
 ) -> str:
-    """Build smooth jitter-free zoompan filter using supersampling."""
-    total_frames = max(int(duration_sec * fps), 1)
+    """Build smooth jitter-free zoompan filter using supersampling; emits exactly `frames` frames from ONE input frame."""
+    total_frames = max(int(frames), 1)
 
     # 1. Upscale to 2160x3840 (supersampling to avoid integer jitter)
     # 2. Apply smooth zoompan
@@ -71,17 +68,17 @@ def build_zoompan_filter(
 def render_scene_clip(
     image_path: Path,
     output_clip_path: Path,
-    duration_sec: float,
+    frames: int,
     camera_effect: str,
     manifest: CacheManifest,
     force: bool = False,
 ) -> bool:
-    """Render one scene image into an animated MP4 clip. Returns True if rendered, False on cache hit."""
-    vf_filter = build_zoompan_filter(camera_effect, duration_sec, VIDEO_FPS)
+    """Render one scene image into an animated MP4 clip of EXACTLY `frames` frames. True if rendered, False on cache hit."""
+    vf_filter = build_zoompan_filter(camera_effect, frames, VIDEO_FPS)
     fp = fingerprint(
         kind="clip",
         image=image_path,
-        duration=f"{duration_sec:.3f}",
+        frames=frames,
         filter=vf_filter,
         effect=camera_effect,
         width=VIDEO_WIDTH,
@@ -89,6 +86,7 @@ def render_scene_clip(
         fps=VIDEO_FPS,
         preset=CLIP_PRESET,
         pix_fmt=VIDEO_PIX_FMT,
+        input_mode="single_frame",
     )
     if not force and manifest.is_fresh(output_clip_path, fp) and output_clip_path.stat().st_size > 1000:
         return False
@@ -96,17 +94,16 @@ def render_scene_clip(
     ffmpeg_bin = get_ffmpeg_binary()
     part_path = output_clip_path.with_name(output_clip_path.stem + ".part.mp4")
 
+    # Sin -loop 1: zoompan genera los `frames` fotogramas a partir de una sola imagen de entrada.
     cmd = [
         ffmpeg_bin,
         "-y",
-        "-loop",
-        "1",
         "-i",
         str(image_path),
         "-vf",
         vf_filter,
-        "-t",
-        f"{duration_sec:.3f}",
+        "-frames:v",
+        str(frames),
         "-c:v",
         "libx264",
         "-preset",
@@ -133,7 +130,7 @@ def render_all_scene_clips(
     force: bool = False,
     stats: Optional[RunStats] = None,
 ) -> list[Path]:
-    """Render all scene video clips (per-clip cache by image hash + duration + effect)."""
+    """Render all scene video clips (per-clip cache by image hash + frame count + effect)."""
     clips_dir.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
     rendered = 0
@@ -144,7 +141,8 @@ def render_all_scene_clips(
 
     for scene in scenes:
         scene_id = scene["scene_id"]
-        duration_sec = scene.get("duration_sec", 3.0)
+        frames = scene_frames(scene, VIDEO_FPS)
+        duration_sec = frames / VIDEO_FPS
         camera_effect = scene.get("camera_effect", "zoom_in_slow")
 
         img_path = images_dir / f"scene_{scene_id:02d}.png"
@@ -153,20 +151,21 @@ def render_all_scene_clips(
         did_render = render_scene_clip(
             image_path=img_path,
             output_clip_path=clip_path,
-            duration_sec=duration_sec,
+            frames=frames,
             camera_effect=camera_effect,
             manifest=manifest,
             force=force,
         )
         clips.append(clip_path)
+        detail = f"{frames} fotogramas, {duration_sec:.3f}s, {camera_effect}"
         if did_render:
             rendered += 1
             if stats is not None:
                 stats.clips.append(scene_id)
-            console.print(f"  [green]✓ Clip {scene_id:02d} renderizado ({duration_sec:.2f}s, {camera_effect})[/green]")
+            console.print(f"  [green]✓ Clip {scene_id:02d} renderizado ({detail})[/green]")
         else:
             cached_count += 1
-            console.print(f"  [green]✓ Clip {scene_id:02d} en caché ({duration_sec:.2f}s, {camera_effect})[/green]")
+            console.print(f"  [green]✓ Clip {scene_id:02d} en caché ({detail})[/green]")
 
     console.print(f"[bold green]✓ Clips: {rendered} renderizados, {cached_count} en caché.[/bold green]")
     return clips
@@ -177,26 +176,23 @@ def assemble_final_video(
     timing_metadata: dict[str, Any],
     workspace_dir: Path,
     subtitles_ass_path: Path,
-    bgm_path: Path,
-    whoosh_path: Path,
+    mix_audio_path: Path,
     output_final_path: Path,
     manifest: CacheManifest,
     force: bool = False,
     stats: Optional[RunStats] = None,
 ) -> Path:
-    """Concatenate clips, mix audio tracks (voice, whoosh SFX, BGM), and burn subtitles."""
-    scene_list = timing_metadata.get("scenes", [])
-    clip_inputs = [workspace_dir / "clips" / f"clip_{sc['scene_id']:02d}.mp4" for sc in scene_list]
-    voice_inputs = [workspace_dir / "audio" / sc["audio_file"] for sc in scene_list]
+    """Concatenate clips, burn subtitles and mux the pre-mixed (already normalized) audio track."""
+    scenes = timing_metadata.get("scenes", [])
+    clips_dir = workspace_dir / "clips"
+    clip_inputs = [clips_dir / f"clip_{sc['scene_id']:02d}.mp4" for sc in scenes]
+    total_frames = sum(scene_frames(sc, VIDEO_FPS) for sc in scenes)
     fp = fingerprint(
         kind="final",
         clips=clip_inputs,
-        voices=voice_inputs,
+        total_frames=total_frames,
         subtitles=subtitles_ass_path,
-        bgm=bgm_path,
-        sfx=whoosh_path,
-        sfx_volume=SFX_VOLUME,
-        bgm_volume=BGM_VOLUME,
+        mix=mix_audio_path,
         width=VIDEO_WIDTH,
         height=VIDEO_HEIGHT,
         fps=VIDEO_FPS,
@@ -204,52 +200,19 @@ def assemble_final_video(
         preset=FINAL_PRESET,
         pix_fmt=VIDEO_PIX_FMT,
         audio_bitrate=FINAL_AUDIO_BITRATE,
-        loudnorm=LOUDNORM_FILTER,
     )
     if not force and manifest.is_fresh(output_final_path, fp) and output_final_path.stat().st_size > 10_000:
         console.print(f"[green]✓ Video final en caché:[/] {output_final_path}")
         return output_final_path
 
     ffmpeg_bin = get_ffmpeg_binary()
-    clips_dir = workspace_dir / "clips"
-    audio_dir = workspace_dir / "audio"
 
-    scenes = timing_metadata.get("scenes", [])
-    total_duration = timing_metadata.get("total_duration_sec", 30.0)
-
-    # 1. Prepare video concatenation demuxer list
+    # 1. Concatenate video clips without audio (stream copy: frame counts stay exact)
     concat_list_file = workspace_dir / "clips_concat.txt"
     with open(concat_list_file, "w", encoding="utf-8") as f:
-        for scene in scenes:
-            scene_id = scene["scene_id"]
-            clip_name = f"clip_{scene_id:02d}.mp4"
-            f.write(f"file '{clips_dir / clip_name}'\n")
+        for clip in clip_inputs:
+            f.write(f"file '{clip.as_posix()}'\n")
 
-    # 2. Prepare voice audio concatenation demuxer list
-    audio_concat_list_file = workspace_dir / "audio_concat.txt"
-    with open(audio_concat_list_file, "w", encoding="utf-8") as f:
-        for scene in scenes:
-            audio_name = scene["audio_file"]
-            f.write(f"file '{audio_dir / audio_name}'\n")
-
-    # Concatenate voice to a single normalized wav
-    full_voice_path = workspace_dir / "full_voice.wav"
-    cmd_voice = [
-        ffmpeg_bin,
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(audio_concat_list_file),
-        "-c:a",
-        "pcm_s16le",
-        str(full_voice_path),
-    ]
-    run_cmd(cmd_voice, "Concatenación de audio de locución")
-
-    # Concatenate video clips without audio
     raw_video_path = workspace_dir / "raw_video.mp4"
     cmd_concat_video = [
         ffmpeg_bin,
@@ -266,54 +229,12 @@ def assemble_final_video(
     ]
     run_cmd(cmd_concat_video, "Concatenación de clips de video")
 
-    # 3. Build audio mixing graph: voice (vol 1.0) + whooshes (vol 0.18) + bgm (vol 0.10)
-    # Transitions happen at the start of each scene starting from scene 2
-    transition_offsets_ms: list[int] = []
-    current_acc_ms = 0
-    for idx, scene in enumerate(scenes):
-        dur_ms = round(scene.get("duration_sec", 3.0) * 1000)
-        if idx > 0:
-            transition_offsets_ms.append(current_acc_ms)
-        current_acc_ms += dur_ms
+    console.print("[cyan]Quemando subtítulos y empaquetando el audio mezclado...[/cyan]")
 
-    console.print(f"[cyan]Construyendo mezcla de audio y quemando subtítulos ({len(transition_offsets_ms)} transiciones SFX)...[/cyan]")
-
-    # Audio filtergraph construction
-    # Inputs:
-    # 0: raw_video.mp4 (video)
-    # 1: full_voice.wav (audio)
-    # 2: bgm.mp3 (audio)
-    # 3: whoosh.mp3 (audio)
-    bgm_fade_start = max(total_duration - 1.0, 0.5)
-
-    filter_complex_parts = []
-    # Voice normalization
-    filter_complex_parts.append("[1:a]volume=1.0[voice]")
-
-    # BGM with volume 0.10, looping if needed, and 1-second fadeout
-    filter_complex_parts.append(
-        f"[2:a]aloop=loop=-1:size=2e+09,volume={BGM_VOLUME},"
-        f"afade=t=in:ss=0:d=1,afade=t=out:st={bgm_fade_start:.2f}:d=1[bgm]"
-    )
-
-    # Whoosh SFX at transitions
-    if transition_offsets_ms and whoosh_path.exists():
-        num_trans = len(transition_offsets_ms)
-        filter_complex_parts.append(f"[3:a]volume={SFX_VOLUME},asplit={num_trans}" + "".join(f"[w{i}]" for i in range(num_trans)))
-        for i, delay_ms in enumerate(transition_offsets_ms):
-            filter_complex_parts.append(f"[w{i}]adelay={delay_ms}|{delay_ms}[dw{i}]")
-        sfx_inputs = "".join(f"[dw{i}]" for i in range(num_trans))
-        filter_complex_parts.append(f"{sfx_inputs}amix=inputs={num_trans}:dropout_transition=0:normalize=0[all_sfx]")
-        filter_complex_parts.append(f"[voice][bgm][all_sfx]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,{LOUDNORM_FILTER}[aout]")
-    else:
-        filter_complex_parts.append(f"[voice][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,{LOUDNORM_FILTER}[aout]")
-
-    # Subtitles video filter in filter_complex
+    # 2. Burn subtitles; the audio is the finished mix_final.wav (no audio filters here)
     escaped_ass = str(subtitles_ass_path).replace("\\", "/").replace(":", "\\:")
     escaped_fontsdir = str(FONTS_DIR).replace("\\", "/").replace(":", "\\:")
-    filter_complex_parts.append(f"[0:v]subtitles='{escaped_ass}':fontsdir='{escaped_fontsdir}'[vout]")
-
-    filter_complex_str = ";".join(filter_complex_parts)
+    vf = f"subtitles='{escaped_ass}':fontsdir='{escaped_fontsdir}'"
 
     part_final_path = output_final_path.with_name(output_final_path.stem + ".part.mp4")
     cmd_final = [
@@ -322,21 +243,13 @@ def assemble_final_video(
         "-i",
         str(raw_video_path),
         "-i",
-        str(full_voice_path),
-        "-i",
-        str(bgm_path),
-    ]
-
-    if transition_offsets_ms and whoosh_path.exists():
-        cmd_final.extend(["-i", str(whoosh_path)])
-
-    cmd_final.extend([
-        "-filter_complex",
-        filter_complex_str,
+        str(mix_audio_path),
+        "-vf",
+        vf,
         "-map",
-        "[vout]",
+        "0:v:0",
         "-map",
-        "[aout]",
+        "1:a:0",
         "-c:v",
         "libx264",
         "-crf",
@@ -349,13 +262,13 @@ def assemble_final_video(
         "aac",
         "-b:a",
         FINAL_AUDIO_BITRATE,
-        "-shortest",
+        # Sin -shortest: video y audio miden lo mismo (fotogramas * 1600 muestras).
         "-movflags",
         "+faststart",
         str(part_final_path),
-    ])
+    ]
 
-    run_cmd(cmd_final, "Render final (mezcla de audio y subtítulos)")
+    run_cmd(cmd_final, "Render final (subtítulos y audio mezclado)")
     os.replace(part_final_path, output_final_path)
     manifest.record(output_final_path, fp)
     if stats is not None:

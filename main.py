@@ -34,6 +34,7 @@ from script_engine import (
 from tts_engine import generate_tts_sync
 from image_engine import FLUX_COST_USD, ImageOverrides, generate_images_sync
 from subtitle_engine import generate_subtitles_ass
+from audio_engine import mix_audio
 from video_engine import render_all_scene_clips, assemble_final_video
 
 for _stream in (sys.stdout, sys.stderr):
@@ -113,7 +114,7 @@ class ForceFlags:
     script: bool = False
     audio: bool = False
     images: bool = False
-    video: bool = False  # clips + video final
+    video: bool = False  # clips + mezcla de audio + video final
 
     @classmethod
     def all(cls) -> "ForceFlags":
@@ -200,13 +201,22 @@ def run_pipeline(
     whoosh_file = Path(env_status["whoosh"])
     final_video_path = workspace / "final_video.mp4"
 
+    mix_path = mix_audio(
+        timing_metadata=timing_metadata,
+        workspace_dir=workspace,
+        bgm_path=bgm_file,
+        whoosh_path=whoosh_file,
+        manifest=manifest,
+        force=force.video,
+        stats=stats,
+    )
+
     assemble_final_video(
         project=project,
         timing_metadata=timing_metadata,
         workspace_dir=workspace,
         subtitles_ass_path=ass_path,
-        bgm_path=bgm_file,
-        whoosh_path=whoosh_file,
+        mix_audio_path=mix_path,
         output_final_path=final_video_path,
         manifest=manifest,
         force=force.video,
@@ -300,7 +310,7 @@ def generate(
     force_video: bool = typer.Option(
         False,
         "--force-video",
-        help="Re-renderizar solo los clips y el video final.",
+        help="Re-renderizar solo los clips, la mezcla de audio y el video final.",
     ),
     voice: Optional[str] = typer.Option(
         None,
@@ -378,7 +388,7 @@ def generate(
     table.add_row("Título", result.project.title)
     table.add_row("Perfil", prof_obj.name)
     table.add_row("Escenas", str(len(result.project.scenes)))
-    table.add_row("Duración Total", f"{result.timing_metadata.get('total_duration_sec', 0)} segundos")
+    table.add_row("Duración Total", f"{result.timing_metadata.get('total_duration_sec', 0):.2f} segundos ({result.timing_metadata.get('total_frames', 0)} fotogramas)")
     table.add_row("Regenerado", _stats_line(result.stats))
     table.add_row("Archivo MP4 Final", str(result.final_video_path))
     table.add_row("Metadatos Publicación", str(project_workspace / "post_metadata.txt"))
@@ -392,7 +402,8 @@ def generate(
 def _stats_line(stats: RunStats) -> str:
     return (
         f"guion: {'sí' if stats.script else 'no'} | audio: {len(stats.audio)} | imágenes: {len(stats.images)} | "
-        f"clips: {len(stats.clips)} | video final: {'sí' if stats.final else 'no (en caché)'}"
+        f"clips: {len(stats.clips)} | mezcla de audio: {'sí' if stats.mix else 'no (en caché)'} | "
+        f"video final: {'sí' if stats.final else 'no (en caché)'}"
     )
 
 
@@ -526,6 +537,7 @@ def retry_scene(
     table.add_row("Audio regenerado", _fmt_ids(stats.audio))
     table.add_row("Imagen regenerada", _fmt_ids(stats.images))
     table.add_row("Clip re-renderizado", _fmt_ids(stats.clips))
+    table.add_row("Mezcla de audio", "regenerada" if stats.mix else "sin cambios (en caché)")
     table.add_row("Video final", "re-renderizado" if stats.final else "sin cambios (en caché)")
     table.add_row(
         "Costo Fal.ai estimado",
