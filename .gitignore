@@ -1,0 +1,22 @@
+# Entornos virtuales
+.venv/
+env/
+venv/
+
+# Variables de entorno y llaves secretas (NUNCA SUBIR A GIT)
+.env
+.env.local
+.env.*.local
+
+# Archivos de trabajo y videos generados
+workspace/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
