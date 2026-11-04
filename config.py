@@ -2,6 +2,7 @@
 
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -12,6 +13,7 @@ FONTS_DIR = ASSETS_DIR / "fonts"
 AUDIO_DIR = ASSETS_DIR / "audio"
 MUSIC_DIR = ASSETS_DIR / "music"  # biblioteca de música de fondo: subcarpeta por perfil + raíz como pool compartido
 WORKSPACE_DIR = BASE_DIR / "workspace"
+CHARACTERS_DIR = BASE_DIR / "characters"  # biblioteca de personajes persistentes: characters/<slug>/character.json + ref.png
 
 # Load .env file
 load_dotenv(BASE_DIR / ".env")
@@ -19,9 +21,116 @@ load_dotenv(BASE_DIR / ".env")
 # Fal.ai API Key
 FAL_KEY = os.getenv("FAL_KEY", "").strip()
 
+# Personaje protagonista persistente (perfiles con uses_protagonist): id fijo que usa el guion en
+# characters / characters_in_scene; su identidad visual sale de la imagen de referencia de la biblioteca.
+PROTAGONIST_ID = "protagonist"
+
+# Seedream v4.5 (ByteDance, vía Fal.ai): image_size {"width","height"} válido si AMBOS lados están en [1920, 4096] o si el
+# total de píxeles está en [2560x1440, 4096x4096] (verificado en el OpenAPI de Fal). Se pide 2560x1440 / 1440x2560 y
+# luego se recorta/escala al tamaño del formato.
+SEEDREAM_MIN_SIDE, SEEDREAM_MAX_SIDE = 1920, 4096
+SEEDREAM_MIN_PIXELS, SEEDREAM_MAX_PIXELS = 2560 * 1440, 4096 * 4096
+
+
+def seedream_size_valid(size: dict) -> bool:
+    """True si el image_size cumple las restricciones de Seedream v4.5 (ver arriba)."""
+    w, h = int(size["width"]), int(size["height"])
+    sides_ok = SEEDREAM_MIN_SIDE <= w <= SEEDREAM_MAX_SIDE and SEEDREAM_MIN_SIDE <= h <= SEEDREAM_MAX_SIDE
+    pixels_ok = SEEDREAM_MIN_PIXELS <= w * h <= SEEDREAM_MAX_PIXELS
+    return sides_ok or pixels_ok
+
+
+# Formatos de video: toda la geometría que depende del aspecto (resolución, imagen Flux, subtítulos, gancho y textos
+# del prompt) vive aquí. Los motores reciben el VideoFormat del proyecto (script.json -> video_format); no leen
+# VIDEO_WIDTH / SUBTITLE_* directamente.
+@dataclass(frozen=True)
+class VideoFormat:
+    id: str
+    width: int  # resolución de salida (px); también PlayResX del .ass
+    height: int  # PlayResY del .ass: los Fontsize del .ass están en estas unidades
+    flux_image_size: dict  # tamaño que se pide a Flux (múltiplos de 16, <= ~1 megapíxel: Fal factura schnell por megapíxel)
+    seedream_image_size: dict  # tamaño que se pide a Seedream v4.5 (proyectos con protagonista; ver seedream_size_valid)
+    composition_hint: str  # inglés; sufijo de composición de cada prompt de imagen (zonas libres para gancho y subtítulos)
+    platform_label_es: str  # español; destino del video en el prompt del guionista
+    subtitle_font_size: int
+    subtitle_outline: int
+    subtitle_shadow: int
+    subtitle_margin_lr: int  # márgenes laterales del .ass; también del estilo del gancho
+    subtitle_max_line_width_px: int  # ninguna línea de un bloque debe superarlo (los bloques anchos se parten)
+    subtitle_pos_y_frac: float  # centro vertical de los subtítulos (fracción de la altura)
+    hook_font_size: int
+    hook_pos_y_frac: float  # borde superior del texto gancho (fracción de la altura)
+    hook_box_padding: int
+    reach_hashtags: tuple[str, ...]  # etiquetas genéricas de alcance que se añaden al final de post_metadata.txt
+
+
+FORMATS: dict[str, VideoFormat] = {
+    # 9:16 (TikTok, Reels, Shorts). NO modificar: sus valores forman parte de las huellas de caché de los videos ya pagados.
+    "vertical": VideoFormat(
+        id="vertical",
+        width=1080,
+        height=1920,
+        flux_image_size={"width": 768, "height": 1360},  # ~1 megapíxel, ~9:16
+        seedream_image_size={"width": 1440, "height": 2560},  # 9:16 exacto: el recorte a 1080x1920 es solo un reescalado
+        composition_hint=(
+            "Vertical 9:16 frame, main subject centered with clear separation from the background, "
+            "simple uncluttered top and bottom areas. No text, no letters, no captions, no logos, no watermark."
+        ),
+        platform_label_es="videos verticales en español (TikTok, Reels, Shorts)",
+        subtitle_font_size=100,
+        subtitle_outline=8,  # contorno grueso para leer sobre cualquier imagen
+        subtitle_shadow=4,
+        subtitle_margin_lr=90,  # (1080 - 2*90) = 900 px disponibles; libass ajusta el texto dentro de esos márgenes
+        subtitle_max_line_width_px=900,
+        subtitle_pos_y_frac=0.64,  # zona segura: 60-68 % de la altura; evita el 20 % inferior
+        hook_font_size=110,
+        hook_pos_y_frac=0.15,  # evita el 12 % superior de la UI de la plataforma
+        hook_box_padding=16,
+        reach_hashtags=("#shorts", "#fyp", "#parati"),
+    ),
+    # 16:9 (YouTube). A PlayResY=1080 los Fontsize son más chicos que a 1920; subtítulos en el quinto inferior.
+    "horizontal": VideoFormat(
+        id="horizontal",
+        width=1920,
+        height=1080,
+        flux_image_size={"width": 1280, "height": 720},  # 0.92 megapíxeles: queda bajo la unidad de facturación de 1 MP
+        seedream_image_size={"width": 2560, "height": 1440},  # 16:9 exacto: el recorte a 1920x1080 es solo un reescalado
+        composition_hint=(
+            "Horizontal 16:9 widescreen cinematic frame, subject placed on the rule of thirds, "
+            "leave empty headroom in the top fifth and keep the lower fifth simple. No text, no letters, no captions, no logos, no watermark."
+        ),
+        platform_label_es="videos horizontales en español para YouTube (formato 16:9, pantalla ancha)",
+        subtitle_font_size=90,
+        subtitle_outline=6,
+        subtitle_shadow=3,
+        subtitle_margin_lr=200,  # (1920 - 2*200) = 1520 px disponibles
+        subtitle_max_line_width_px=1480,
+        subtitle_pos_y_frac=0.83,  # quinto inferior, por encima de los controles del reproductor
+        hook_font_size=84,
+        hook_pos_y_frac=0.08,
+        hook_box_padding=12,
+        reach_hashtags=(),  # en YouTube horizontal las etiquetas genéricas no aportan alcance
+    ),
+}
+DEFAULT_FORMAT = "vertical"
+for _fmt in FORMATS.values():
+    assert seedream_size_valid(_fmt.seedream_image_size), f"seedream_image_size inválido en el formato {_fmt.id}"
+
+
+def get_format(format_id: str) -> VideoFormat:
+    """Devuelve el formato por id; lanza ValueError con la lista disponible si no existe."""
+    key = (format_id or "").strip().lower()
+    if key not in FORMATS:
+        raise ValueError(f"Formato desconocido '{format_id}'. Formatos disponibles: {', '.join(FORMATS)}")
+    return FORMATS[key]
+
+
+# Alias de compatibilidad: los valores del formato vertical (los motores usan el VideoFormat que reciben, no estos).
+_VERTICAL = FORMATS["vertical"]
+
 # Video output specifications
-VIDEO_WIDTH = 1080
-VIDEO_HEIGHT = 1920
+VIDEO_WIDTH = _VERTICAL.width
+VIDEO_HEIGHT = _VERTICAL.height
 VIDEO_FPS = 30
 VIDEO_CRF = 20
 VIDEO_PIX_FMT = "yuv420p"
@@ -37,7 +146,7 @@ CAMERA_EFFECTS = ("zoom_in_fast", "zoom_in_slow", "zoom_out", "pan_right", "pan_
 DEFAULT_CAMERA_EFFECT = "zoom_in_slow"  # respaldo si un guion trae un efecto desconocido
 
 # Metadatos de publicación: etiquetas genéricas de alcance que siempre se añaden al final (mantenerlas pocas: 2-3)
-REACH_HASHTAGS = ["#shorts", "#fyp", "#parati"]
+REACH_HASHTAGS = list(_VERTICAL.reach_hashtags)  # alias de compatibilidad; usar VideoFormat.reach_hashtags
 MAX_HASHTAGS = 8  # tope de hashtags temáticos del guion
 
 # Subtitle styling
@@ -48,32 +157,50 @@ SUBTITLE_FONT_BOLD = 0  # el peso ya está en el nombre de la familia
 SUBTITLE_FONT_FILENAME = "Montserrat-ExtraBold.ttf"
 SUBTITLE_FONT_URL = "https://raw.githubusercontent.com/JulietaUla/Montserrat/master/fonts/ttf/Montserrat-ExtraBold.ttf"
 
-# Tamaño y geometría (a PlayResX=1080). libass renderiza Fontsize=100 con ~65 px de em en esta fuente (medido con ffmpeg/libass).
+# Tamaño y geometría: libass renderiza Fontsize=100 con ~65 px de em en esta fuente (medido con ffmpeg/libass).
+# Lo que depende del formato (tamaño, contorno, márgenes, posición) está en FORMATS; aquí solo lo común a todos.
 SUBTITLE_LIBASS_EM_RATIO = 0.68  # px de em por unidad de Fontsize: 0.65 medido + ~5 % de margen; solo para estimar anchos
-SUBTITLE_FONT_SIZE = 100
-SUBTITLE_OUTLINE = 8  # contorno grueso para leer sobre cualquier imagen
-SUBTITLE_SHADOW = 4
 SUBTITLE_SPACING = 2
-SUBTITLE_MARGIN_LR = 90  # (1080 - 2*90) = 900 px disponibles; libass ajusta el texto dentro de esos márgenes
-SUBTITLE_MAX_LINE_WIDTH_PX = 900  # ninguna línea de un bloque debe superarlo: los bloques anchos se parten en bloques más chicos
-SUBTITLE_POS_Y_FRAC = 0.64  # centro vertical de los subtítulos (zona segura: 60-68 % de la altura; evita el 20 % inferior)
 # Colores ASS (&HBBGGRR&): palabra activa del karaoke, palabra clave y texto normal
 SUBTITLE_NORMAL_COLOR = "&H00FFFFFF&"  # blanco
 SUBTITLE_ACTIVE_COLOR = "&H0000FFFF&"  # amarillo
 SUBTITLE_KEYWORD_COLOR = "&H00FFFF00&"  # cian (si una palabra clave es la activa gana el amarillo)
 SUBTITLE_ACTIVE_SCALE = 112  # % de escala de la palabra activa (pop); el resto va a 100
 # Texto gancho (hook): arriba, en mayúsculas, caja de color
-HOOK_FONT_SIZE = 110
-HOOK_POS_Y_FRAC = 0.15  # borde superior del texto gancho (15 % de la altura; evita el 12 % superior de la UI)
 HOOK_MAX_SEC = 3.0  # el gancho dura hasta el fin de la escena 1 o esto, lo que sea menor
 HOOK_TEXT_COLOR = "&H00FFFFFF&"
 HOOK_BOX_COLOR = "&H003C1EE6&"  # caja carmesí
-HOOK_BOX_PADDING = 16
 
-# Imágenes (Flux schnell): ~1 megapíxel con aspecto ~9:16 (ambos lados múltiplos de 16). Fal factura schnell por megapíxel.
-FLUX_IMAGE_SIZE = {"width": 768, "height": 1360}
+# Alias de compatibilidad con el formato vertical (ver FORMATS)
+SUBTITLE_FONT_SIZE = _VERTICAL.subtitle_font_size
+SUBTITLE_OUTLINE = _VERTICAL.subtitle_outline
+SUBTITLE_SHADOW = _VERTICAL.subtitle_shadow
+SUBTITLE_MARGIN_LR = _VERTICAL.subtitle_margin_lr
+SUBTITLE_MAX_LINE_WIDTH_PX = _VERTICAL.subtitle_max_line_width_px
+SUBTITLE_POS_Y_FRAC = _VERTICAL.subtitle_pos_y_frac
+HOOK_FONT_SIZE = _VERTICAL.hook_font_size
+HOOK_POS_Y_FRAC = _VERTICAL.hook_pos_y_frac
+HOOK_BOX_PADDING = _VERTICAL.hook_box_padding
+
+# Imágenes (Flux schnell): el tamaño de cada formato está en FORMATS (flux_image_size; múltiplos de 16, <= ~1 megapíxel:
+# Fal factura schnell por megapíxel). Alias del formato vertical:
+FLUX_IMAGE_SIZE = _VERTICAL.flux_image_size
 FLUX_COST_USD = 0.003  # costo estimado por imagen Flux schnell (~1 megapíxel)
 FLUX_IMAGE_SIZE_LEGACY = "portrait_16_9"  # 576x1024; las imágenes pagadas con este tamaño se siguen aceptando en caché
+
+# Endpoints de imagen de Fal.ai y su costo por imagen (USD). Los videos SIN protagonista usan Flux schnell; los que tienen
+# protagonista usan Seedream v4.5 en todas las escenas (look coherente): edición con la imagen de referencia del personaje
+# en las escenas donde aparece, texto a imagen en el resto. Seedream cobra un precio fijo por imagen en ambos endpoints.
+FLUX_ENDPOINT = "fal-ai/flux/schnell"
+SEEDREAM_EDIT_ENDPOINT = "fal-ai/bytedance/seedream/v4.5/edit"
+SEEDREAM_T2I_ENDPOINT = "fal-ai/bytedance/seedream/v4.5/text-to-image"
+SEEDREAM_COST_USD = 0.04
+# ÚNICA fuente de verdad para los resúmenes de costo: RunStats.paid_images (endpoint -> imágenes pagadas) x este precio.
+IMAGE_COST_USD: dict[str, float] = {
+    FLUX_ENDPOINT: FLUX_COST_USD,
+    SEEDREAM_EDIT_ENDPOINT: SEEDREAM_COST_USD,
+    SEEDREAM_T2I_ENDPOINT: SEEDREAM_COST_USD,
+}
 
 # Audio: línea de tiempo exacta por muestras (1 fotograma = SAMPLES_PER_FRAME muestras, sin deriva)
 AUDIO_SAMPLE_RATE = 48000

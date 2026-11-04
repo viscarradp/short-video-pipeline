@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from config import AUDIO_SAMPLE_RATE, SAMPLES_PER_FRAME, VIDEO_FPS
+from config import AUDIO_SAMPLE_RATE, IMAGE_COST_USD, SAMPLES_PER_FRAME, VIDEO_FPS
 
 # Se incluye en TODA huella: súbelo cuando cambie el formato de los artefactos para invalidar la caché completa.
 CACHE_VERSION = 1
@@ -149,6 +149,21 @@ class RunStats:
     clips: list[int] = field(default_factory=list)
     mix: bool = False
     final: bool = False
+    # Costo real de la ejecución (USD): imágenes pagadas por endpoint (endpoint -> cantidad) y guion (usage.cost del LLM)
+    paid_images: dict[str, int] = field(default_factory=dict)
+    llm_cost_usd: float = 0.0
+
+    def count_paid_image(self, endpoint: str) -> None:
+        """Registra una imagen real (pagada) generada con `endpoint`; el modo mock no se registra."""
+        self.paid_images[endpoint] = self.paid_images.get(endpoint, 0) + 1
+
+    def image_cost_usd(self) -> float:
+        """Costo de las imágenes pagadas: cantidad por endpoint x config.IMAGE_COST_USD."""
+        return sum(count * IMAGE_COST_USD.get(endpoint, 0.0) for endpoint, count in self.paid_images.items())
+
+    def total_cost_usd(self) -> float:
+        """Costo real de la ejecución: imágenes pagadas + guion (LLM)."""
+        return self.image_cost_usd() + self.llm_cost_usd
 
 
 # --------------------------------------------------------------------------- #

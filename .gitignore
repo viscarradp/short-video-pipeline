@@ -11,6 +11,9 @@ venv/
 # Archivos de trabajo y videos generados
 workspace/
 
+# Biblioteca de personajes persistentes (imágenes de referencia; characters/<slug>/ref.png)
+characters/
+
 # Python cache
 __pycache__/
 *.py[cod]

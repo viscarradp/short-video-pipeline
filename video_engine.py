@@ -11,13 +11,12 @@ from config import (
     CAMERA_EFFECTS,
     CLIP_RENDER_WORKERS,
     DEFAULT_CAMERA_EFFECT,
-    REACH_HASHTAGS,
-    VIDEO_WIDTH,
-    VIDEO_HEIGHT,
+    get_format,
     VIDEO_FPS,
     VIDEO_CRF,
     VIDEO_PIX_FMT,
     FONTS_DIR,
+    VideoFormat,
     get_ffmpeg_binary,
 )
 from pipeline_utils import CacheManifest, PipelineError, RunStats, fingerprint, run_cmd, scene_frames
@@ -34,14 +33,16 @@ FINAL_AUDIO_BITRATE = "192k"
 def build_zoompan_filter(
     camera_effect: str,
     frames: int,
+    video_format: VideoFormat,
     fps: int = VIDEO_FPS,
 ) -> str:
     """Build smooth jitter-free zoompan filter using supersampling; emits exactly `frames` frames from ONE input frame."""
     total_frames = max(int(frames), 1)
 
-    # 1. Upscale to 2160x3840 (supersampling to avoid integer jitter)
+    # 1. Upscale al doble de la resolución del formato (2160x3840 en vertical; supersampling to avoid integer jitter)
     # 2. Apply smooth zoompan
-    # 3. Downscale back to 1080x1920 with lanczos
+    # 3. Downscale back to the format's resolution (1080x1920 en vertical) with lanczos
+    ss_w, ss_h = video_format.width * 2, video_format.height * 2
     effect = camera_effect if camera_effect in CAMERA_EFFECTS else DEFAULT_CAMERA_EFFECT
     center_x = "iw/2-(iw/zoom/2)"
     center_y = "ih/2-(ih/zoom/2)"
@@ -59,24 +60,24 @@ def build_zoompan_filter(
         raise PipelineError(f"Efecto de cámara sin implementar en video_engine: {effect}")
 
     filter_str = (
-        f"scale=2160:3840,"
-        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={total_frames}:s=2160x3840:fps={fps},"
-        f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:flags=lanczos"
+        f"scale={ss_w}:{ss_h},"
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={total_frames}:s={ss_w}x{ss_h}:fps={fps},"
+        f"scale={video_format.width}:{video_format.height}:flags=lanczos"
     )
     return filter_str
 
 
-def clip_fingerprint(image_path: Path, frames: int, camera_effect: str) -> tuple[str, str]:
+def clip_fingerprint(image_path: Path, frames: int, camera_effect: str, video_format: VideoFormat) -> tuple[str, str]:
     """(huella, filtro de video) de un clip: depende del contenido de la imagen, los fotogramas, el efecto y los ajustes."""
-    vf_filter = build_zoompan_filter(camera_effect, frames, VIDEO_FPS)
+    vf_filter = build_zoompan_filter(camera_effect, frames, video_format, VIDEO_FPS)
     fp = fingerprint(
         kind="clip",
         image=image_path,
         frames=frames,
         filter=vf_filter,
         effect=camera_effect,
-        width=VIDEO_WIDTH,
-        height=VIDEO_HEIGHT,
+        width=video_format.width,
+        height=video_format.height,
         fps=VIDEO_FPS,
         preset=CLIP_PRESET,
         pix_fmt=VIDEO_PIX_FMT,
@@ -126,10 +127,11 @@ def render_scene_clip(
     frames: int,
     camera_effect: str,
     manifest: CacheManifest,
+    video_format: VideoFormat,
     force: bool = False,
 ) -> bool:
     """Render one scene image into an animated MP4 clip of EXACTLY `frames` frames. True if rendered, False on cache hit."""
-    fp, vf_filter = clip_fingerprint(image_path, frames, camera_effect)
+    fp, vf_filter = clip_fingerprint(image_path, frames, camera_effect, video_format)
     if not force and manifest.is_fresh(output_clip_path, fp) and output_clip_path.stat().st_size > 1000:
         return False
     encode_scene_clip(image_path, output_clip_path, frames, vf_filter)
@@ -142,6 +144,7 @@ def render_all_scene_clips(
     images_dir: Path,
     clips_dir: Path,
     manifest: CacheManifest,
+    video_format: VideoFormat,
     force: bool = False,
     stats: Optional[RunStats] = None,
     workers: int = CLIP_RENDER_WORKERS,
@@ -158,7 +161,10 @@ def render_all_scene_clips(
     pending: list[tuple[int, Path, Path, int, str, str, str]] = []  # (id, imagen, clip, fotogramas, huella, filtro, detalle)
 
     scenes = timing_metadata.get("scenes", [])
-    console.print(f"[cyan]Clips de video dinámicos a {VIDEO_FPS} fps para {len(scenes)} escenas...[/cyan]")
+    console.print(
+        f"[cyan]Clips de video dinámicos a {VIDEO_FPS} fps ({video_format.width}x{video_format.height}) "
+        f"para {len(scenes)} escenas...[/cyan]"
+    )
 
     for scene in scenes:
         scene_id = scene["scene_id"]
@@ -170,7 +176,7 @@ def render_all_scene_clips(
         clip_path = clips_dir / f"clip_{scene_id:02d}.mp4"
         clips.append(clip_path)
 
-        fp, vf_filter = clip_fingerprint(img_path, frames, camera_effect)
+        fp, vf_filter = clip_fingerprint(img_path, frames, camera_effect, video_format)
         if not force and manifest.is_fresh(clip_path, fp) and clip_path.stat().st_size > 1000:
             cached_count += 1
             console.print(f"  [green]✓ Clip {scene_id:02d} en caché ({detail})[/green]")
@@ -216,6 +222,26 @@ def render_all_scene_clips(
     return clips
 
 
+def final_fingerprint(
+    clip_inputs: list[Path], total_frames: int, subtitles_ass_path: Path, mix_audio_path: Path, video_format: VideoFormat
+) -> str:
+    """Huella del video final: clips, subtítulos y mezcla (por contenido), fotogramas, resolución y ajustes del codificador."""
+    return fingerprint(
+        kind="final",
+        clips=clip_inputs,
+        total_frames=total_frames,
+        subtitles=subtitles_ass_path,
+        mix=mix_audio_path,
+        width=video_format.width,
+        height=video_format.height,
+        fps=VIDEO_FPS,
+        crf=VIDEO_CRF,
+        preset=FINAL_PRESET,
+        pix_fmt=VIDEO_PIX_FMT,
+        audio_bitrate=FINAL_AUDIO_BITRATE,
+    )
+
+
 def assemble_final_video(
     project: VideoProjectSchema,
     timing_metadata: dict[str, Any],
@@ -224,6 +250,7 @@ def assemble_final_video(
     mix_audio_path: Path,
     output_final_path: Path,
     manifest: CacheManifest,
+    video_format: VideoFormat,
     force: bool = False,
     stats: Optional[RunStats] = None,
 ) -> Path:
@@ -232,20 +259,7 @@ def assemble_final_video(
     clips_dir = workspace_dir / "clips"
     clip_inputs = [clips_dir / f"clip_{sc['scene_id']:02d}.mp4" for sc in scenes]
     total_frames = sum(scene_frames(sc, VIDEO_FPS) for sc in scenes)
-    fp = fingerprint(
-        kind="final",
-        clips=clip_inputs,
-        total_frames=total_frames,
-        subtitles=subtitles_ass_path,
-        mix=mix_audio_path,
-        width=VIDEO_WIDTH,
-        height=VIDEO_HEIGHT,
-        fps=VIDEO_FPS,
-        crf=VIDEO_CRF,
-        preset=FINAL_PRESET,
-        pix_fmt=VIDEO_PIX_FMT,
-        audio_bitrate=FINAL_AUDIO_BITRATE,
-    )
+    fp = final_fingerprint(clip_inputs, total_frames, subtitles_ass_path, mix_audio_path, video_format)
     if not force and manifest.is_fresh(output_final_path, fp) and output_final_path.stat().st_size > 10_000:
         console.print(f"[green]✓ Video final en caché:[/] {output_final_path}")
         generate_post_metadata(project, workspace_dir)  # barato; solo reescribe si el guion cambió
@@ -330,12 +344,15 @@ def assemble_final_video(
 PROFILE_FALLBACK_TAGS = {
     "curiosity": ["#datoscuriosos", "#ciencia", "#aprendeentiktok", "#mecanica", "#curiosidades"],
     "micronovela": ["#historiareal", "#suspenso", "#drama", "#chismesito", "#novelas"],
+    "que_pasaria": ["#quepasariasi", "#hipotetico", "#historias", "#apocalipsis", "#ficcion"],
+    "historia": ["#historias", "#aventura", "#relatos", "#animacion", "#cuentos"],
+    "chisme": ["#chisme", "#chismesito", "#drama", "#historiareal", "#salseo"],
 }
 
 
 def build_post_metadata_text(project: VideoProjectSchema) -> str:
     """Texto de post_metadata.txt: título + descripción + hashtags del LLM (con respaldo estático si faltan)
-    y siempre las etiquetas genéricas de alcance (REACH_HASHTAGS) al final."""
+    y siempre las etiquetas genéricas de alcance del formato (VideoFormat.reach_hashtags) al final."""
     description = project.post_description.strip()
     if not description:
         description = (
@@ -346,7 +363,7 @@ def build_post_metadata_text(project: VideoProjectSchema) -> str:
     tags = [f"#{t}" for t in normalize_hashtags(project.hashtags)]
     if not tags:
         tags = PROFILE_FALLBACK_TAGS.get(project.profile, ["#viral", "#reels", "#tendencia"])
-    for reach in REACH_HASHTAGS:
+    for reach in get_format(project.video_format).reach_hashtags:
         if reach.lower() not in {t.lower() for t in tags}:
             tags.append(reach)
 

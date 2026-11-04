@@ -1,29 +1,33 @@
 # ⚡ Short Video Pipeline CLI
 
-Herramienta CLI modular y profesional en Python para automatizar el 100% de la creación de videos verticales (9:16, 1080x1920) para TikTok, Instagram Reels y YouTube Shorts, con edición dinámica, efectos de sonido (SFX whoosh), música de fondo (BGM) y subtítulos animados estilo viral quemados en el video.
+Herramienta CLI modular y profesional en Python para automatizar el 100% de la creación de videos verticales (9:16, 1080x1920) para TikTok, Instagram Reels y YouTube Shorts, o apaisados (16:9, 1920x1080) para YouTube con `--format horizontal`, con edición dinámica, efectos de sonido (SFX whoosh), música de fondo (BGM) y subtítulos animados estilo viral quemados en el video.
 
 ---
 
 ## 🌟 Características Principales
 
 1. **Proveedor de IA Unificado (Fal.ai):**
-   - **Guiones:** `fal-ai/any-llm` configurado con `google/gemini-2.5-flash` para estructuración viral en JSON estricto validado con Pydantic.
-   - **Imágenes:** `fal-ai/flux/schnell` a 768x1360 (~1 megapíxel, ~9:16; `FLUX_IMAGE_SIZE` en `config.py`), reescaladas a 1080x1920 cubriendo el cuadro y recortando al centro (nunca se estiran). Las imágenes pagadas con el tamaño anterior (`portrait_16_9`, 576x1024) se siguen aceptando en caché; solo `--force-images` / `retry-scene` las rehacen al tamaño nuevo.
+   - **Guiones:** `openrouter/router` de Fal.ai con `google/gemini-2.5-flash` para estructuración viral en JSON estricto validado con Pydantic (`fal-ai/any-llm` quedó obsoleto en Fal). El costo real del LLM (`usage.cost`) aparece en el resumen final.
+   - **Imágenes:** `fal-ai/flux/schnell` a 768x1360 en vertical (~1 megapíxel, ~9:16) o 1280x720 en horizontal (0.92 MP; `flux_image_size` de cada formato en `config.FORMATS`), reescaladas a la resolución del video cubriendo el cuadro y recortando al centro (nunca se estiran). Las imágenes pagadas con el tamaño anterior (`portrait_16_9`, 576x1024) se siguen aceptando en caché; solo `--force-images` / `retry-scene` las rehacen al tamaño nuevo.
 2. **Caché por Huella de Contenido (por escena):**
    - Cada proyecto opera en `./workspace/<slug>/` y guarda `cache_manifest.json` con la huella (sha256) de cada artefacto.
    - Solo se rehace lo que realmente cambió: otra voz regenera el audio (y los clips cuya duración cambie), editar a mano la narración o el prompt de una escena en `script.json` rehace solo esa escena, y cambiar `--music` rehace solo el video final.
    - `--force` / `--force-script|audio|images|video` ignoran la caché de una etapa concreta.
-   - El guion incluye `hook_text`, `post_description` y `hashtags`; la narración de cada escena tiene un presupuesto de palabras calculado del perfil (`target_scene_duration_sec` x 2.7 palabras/s x (1 + velocidad de la voz)) y la frase de cierre del perfil (`ending_call_to_action`) se garantiza al final del último texto.
+   - El guion incluye `hook_text`, `post_description` y `hashtags`; la narración de cada escena tiene un presupuesto de palabras calculado del perfil (`target_scene_duration_sec` x palabras/s de la voz: las medidas del perfil si las tiene, o 2.7 x (1 + velocidad de la voz)) y la frase de cierre del perfil (`ending_call_to_action`) se garantiza al final del último texto.
    - Flags `--mock-script` y `--mock-images`: guion de demostración local e imágenes de prueba con Pillow para depurar todo el flujo sin gastar saldo ($0.00).
 3. **Perfiles Desacoplados (`--profile`):**
    - **`curiosity`:** Ritmo rápido (15 a 18 escenas de ~3.5s), voz enérgica (`rate="+22%"`), estilo visual por defecto `explainer_3d` (render 3D con cortes transversales).
    - **`micronovela`:** Ritmo dramático (10 a 12 escenas de ~5s), voz dramática (`rate="+8%"`), consistencia física de personajes inyectada en cada prompt, estilo visual por defecto `telenovela_cine`, y cierre con cliffhanger ("Parte 2 en el perfil").
+   - **`que_pasaria`:** escenarios hipotéticos tipo "¿Qué pasaría si...?" (apocalipsis, mundos alterados) con un protagonista recurrente. Voz Jorge a `rate="+40%"`, estilo por defecto `cine_realista`, cierre "Suscríbete para el siguiente escenario".
+   - **`historia`:** aventuras narradas protagonizadas por un personaje recurrente. Misma voz, ritmo y estilo que `que_pasaria`; cierre "Suscríbete para la siguiente aventura".
+   - **`chisme`:** chismes narrados con un protagonista y personajes secundarios; admite escenarios hipotéticos. Voz Dalia a `rate="+40%"`, estilo por defecto `telenovela_cine` (con `--style cine_realista` para escenarios fantásticos).
+   - Los tres son de **YouTube horizontal** por defecto (16:9), con escenas de ~5 s (unas 15 palabras de narración cada una), **~2 minutos** por defecto (`--minutes` lo cambia) y **requieren `--character`**.
 4. **Regeneración Quirúrgica (`retry-scene`):** repite la imagen (o corrige la narración) de una escena sin tocar el resto.
 5. **Locución y Timings al Milisegundo:**
    - `edge-tts` asíncrono con captura en tiempo real de eventos `WordBoundary`.
 6. **Subtítulos Virales Dinámicos:**
-   - Archivo `.ass` a resolución 1080x1920, Fontsize 100 con contorno grueso, en la zona segura (centro al 64 % de la altura; evita el 20 % inferior y el 12 % superior).
-   - Bloques de 1 a 3 palabras que nunca superan ~900 px de ancho (los anchos se parten en bloques menores).
+   - Archivo `.ass` a la resolución del formato. Vertical (1080x1920): Fontsize 100 con contorno grueso, en la zona segura (centro al 64 % de la altura; evita el 20 % inferior y el 12 % superior). Horizontal (1920x1080): Fontsize 90, contorno 6, centro al 83 % de la altura (quinto inferior).
+   - Bloques de 1 a 3 palabras que nunca superan el ancho máximo del formato (~900 px en vertical, ~1480 px en horizontal; los anchos se parten en bloques menores).
    - Karaoke: la palabra que se está diciendo va en amarillo con un pequeño pop de escala (112 %); las palabras clave y los números van en cian (si una palabra clave es la activa gana el amarillo). Un evento por palabra, sin huecos ni solapes.
    - Texto gancho (`hook_text`): caja de color en la parte superior, en mayúsculas, durante la escena 1 (máx. 3 s).
 7. **Ensamblado FFmpeg con Zero-Jitter:**
@@ -34,7 +38,7 @@ Herramienta CLI modular y profesional en Python para automatizar el 100% de la c
    - Los clips se renderizan en paralelo (`CLIP_RENDER_WORKERS`, por defecto `max(1, min(4, cpus // 2))`; se puede fijar con la variable de entorno del mismo nombre).
    - Mezcla de audio como etapa propia (`audio/mix_final.wav`) normalizada a **-14 LUFS** con `loudnorm` de dos pasadas (techo -1.5 dBTP).
    - Línea de tiempo exacta por fotogramas: cada escena dura un número entero de fotogramas y su audio un número entero de muestras (1 fotograma = 1600 muestras a 48 kHz), así cortes, whooshes y subtítulos no se desfasan.
-   - Generación de `post_metadata.txt` con el título, la descripción y los hashtags del guion (con respaldo estático si faltan) más etiquetas de alcance (`REACH_HASHTAGS`: #shorts #fyp #parati).
+   - Generación de `post_metadata.txt` con el título, la descripción y los hashtags del guion (con respaldo estático si faltan) más etiquetas de alcance (#shorts #fyp #parati en vertical; ninguna en horizontal, según `reach_hashtags` de cada formato).
 
 ---
 
@@ -72,7 +76,7 @@ pip install -r requirements.txt
 
 ## 🎬 Uso
 
-`main.py` tiene tres comandos: **`generate`** (video completo), **`retry-scene`** (regenerar escenas) y **`styles`** (listar estilos visuales). Ejecuta `python main.py --help` para verlos.
+`main.py` tiene cinco comandos: **`generate`** (video completo), **`retry-scene`** (regenerar escenas), **`styles`** (listar estilos visuales), **`create-character`** y **`characters`** (biblioteca de personajes). Ejecuta `python main.py --help` para verlos.
 
 ### 1. Prueba gratuita (Costo $0.00)
 Guion de demostración + imágenes de prueba locales; la voz (`edge-tts`) es real y gratuita:
@@ -80,7 +84,7 @@ Guion de demostración + imágenes de prueba locales; la voz (`edge-tts`) es rea
 python main.py generate --profile curiosity --topic "Qué pasa en tu motor si usas gasolina barata" --slug motor-gasolina --mock-script --mock-images
 ```
 
-### 2. Producción real (Fal.ai: guion con any-llm + imágenes Flux/schnell)
+### 2. Producción real (Fal.ai: guion con openrouter/router + imágenes Flux/schnell)
 ```powershell
 python main.py generate --profile curiosity --topic "Qué pasa en tu motor si usas gasolina barata" --slug motor-gasolina
 ```
@@ -91,14 +95,25 @@ Volver a ejecutar el mismo comando no regenera nada (todo sale "en caché").
 python main.py generate --profile micronovela --topic "Mi hermano hipotecó la casa de mi abuela en secreto" --slug casa-abuela --mock-images
 ```
 
+### 4. Protagonista recurrente (YouTube horizontal)
+Crea primero el personaje (dos candidatas con Seedream v4.5, ~$0.08) y luego genera el video con él:
+```powershell
+python main.py create-character max --name "Max" --description "Latino man in his early 30s, short dark wavy hair, trimmed beard, athletic build, mustard-yellow hoodie, dark jeans" --style cine_realista --candidates 2
+python main.py generate --profile que_pasaria --topic "¿Qué pasaría si despertaras y fueras la última persona en la Tierra?" --character max --style cine_apocaliptico --minutes 3
+```
+Si no te gusta la candidata elegida, `python main.py create-character max --choose 2` cambia la referencia sin pagar nada.
+
 ### Opciones de `generate`
-- `--profile`, `-p`: `curiosity` o `micronovela`.
+- `--profile`, `-p`: `curiosity`, `micronovela`, `que_pasaria`, `historia` o `chisme` (ver *Características*).
 - `--topic`, `-t`: Tema del video (requerido).
 - `--slug`, `-s`: Nombre de la carpeta en `./workspace/`.
 - `--mock-script`: Guion de demostración local en lugar de Fal.ai (no respeta el tema).
 - `--mock-images`, `-m`: Imágenes de prueba con Pillow en lugar de Flux.
 - `--voice`, `-v`: Voz TTS (ej. `es-MX-JorgeNeural`, `es-MX-DaliaNeural`).
 - `--style`: Estilo visual (ver `python main.py styles` y la sección *Estilos visuales*). Por defecto, el del guion en caché o el del perfil.
+- `--format`: `vertical` (1080x1920, Shorts/Reels/TikTok) o `horizontal` (1920x1080, YouTube); ver *Formatos de video*. Por defecto, el del proyecto existente o el `default_format` del perfil.
+- `--character`: Slug de un personaje de la biblioteca (ver *Biblioteca de personajes*). Obligatorio en `que_pasaria`, `historia` y `chisme`; con protagonista las imágenes usan Seedream v4.5 (~$0.04 c/u) en lugar de Flux.
+- `--minutes`: Duración objetivo en minutos (de 0.5 a 15); ajusta el número de escenas del guion. Por defecto, la del perfil.
 - `--music`: Ruta a una pista de música de fondo (`.mp3`, `.m4a` o `.wav`). Sin esta opción se elige una de `assets/music/`.
 - `--force`, `-f`: Ignorar la caché de **todas** las etapas.
 - `--force-script`: Regenerar solo el guion. Ojo: un guion nuevo suele traer prompts nuevos, es decir, **volver a pagar las imágenes**.
@@ -125,10 +140,36 @@ python main.py retry-scene --slug motor-gasolina --scene 4 --narration "Texto co
 ```
 - `--scene` es repetible; cada escena debe existir. `--prompt` y `--narration` solo se admiten con una única `--scene`.
 - Toda escena seleccionada obtiene una imagen nueva, salvo que solo se indique `--narration`.
-- Solo se rehacen el audio/imagen/clip afectados y el video final. Al terminar se muestra un resumen con el costo estimado de Fal.ai (imágenes Flux reales × $0.003; $0 en modo mock).
+- Solo se rehacen el audio/imagen/clip afectados y el video final. Al terminar se muestra un resumen con el costo real de Fal.ai (imágenes pagadas × precio de cada modelo; $0 en modo mock). Ver *Costos*.
+
+### Biblioteca de personajes
+Los perfiles con protagonista (`que_pasaria`, `historia`, `chisme`) usan un personaje persistente guardado en `characters/<slug>/`, para que tenga la misma cara en todas las escenas:
+```powershell
+python main.py create-character <slug> --name "..." --description "..." [--style <id>] [--candidates N]   # genera N candidatas con Seedream v4.5
+python main.py create-character <slug> --from-image ruta\a\foto.png                                       # importa tu propia imagen (sin costo)
+python main.py create-character <slug> --choose 2                                                         # cambia la referencia a la candidata 2 (sin costo)
+python main.py characters                                                                                 # lista la biblioteca
+```
+- **Candidatas:** `--candidates` va de 1 a 6 (por defecto 2) y cada una cuesta $0.04 (Seedream v4.5 text-to-image, 2048x2048). La descripción física (`--description`) va **en inglés** y se inyecta en los prompts de las escenas; `--style` define el look de las candidatas.
+- **Referencia:** `ref.png` es una copia de la candidata elegida (por defecto la 1). Cambiarla con `--choose` no genera nada, pero las escenas con el protagonista se regeneran la próxima vez que se haga un video que lo use.
+- **Estructura:** `characters/<slug>/character.json` (nombre, descripción, origen y candidata elegida), `ref.png` (la referencia) y `candidate_NN.png`. El slug admite letras, números, `-` y `_`. La carpeta `characters/` está en `.gitignore`: las imágenes no se suben a git.
+- **Tip:** una prenda o accesorio distintivo en la descripción (p. ej. "mustard-yellow hoodie", "round red glasses") ayuda a que el personaje se reconozca igual en todas las escenas.
 
 ### Estilos visuales
-El aspecto de las imágenes lo define un **estilo** del catálogo `STYLES` en `styles.py` (6 incluidos), independiente del perfil.
+El aspecto de las imágenes lo define un **estilo** del catálogo `STYLES` en `styles.py` (9 incluidos), independiente del perfil.
+
+| ID | Nombre | Por defecto en |
+|---|---|---|
+| `explainer_3d` | Explicativo 3D | `curiosity` |
+| `macro_lab` | Macro de laboratorio | - |
+| `clay_miniature` | Miniatura de plastilina | - |
+| `telenovela_cine` | Telenovela cinematográfica | `micronovela`, `chisme` |
+| `noir_suspense` | Suspenso noir | - |
+| `graphic_novel` | Novela gráfica | - |
+| `cine_realista` | Cine realista | `que_pasaria`, `historia` |
+| `cine_apocaliptico` | Cine apocalíptico | - |
+| `animacion_3d` | Animación 3D | - |
+
 ```powershell
 python main.py styles                                   # tabla: id, nombre, descripción y perfiles que lo usan por defecto
 python main.py generate --profile curiosity --topic "..." --style clay_miniature
@@ -138,6 +179,32 @@ python main.py generate --profile curiosity --topic "..." --style clay_miniature
 - **Añadir un estilo:** agrega una entrada a `STYLES` en `styles.py` (`id`, `label`, `description`, `image_suffix` en inglés de menos de ~45 palabras y `scene_guidance` para el guionista). Aparece solo en `styles` y `--style`. Para que un perfil lo use por defecto, cambia su `default_style_id` en `profiles.py`.
 - **Los videos existentes conservan su estilo:** los `script.json` antiguos (sin `visual_style_id`) siguen componiendo el prompt exactamente como antes, así que sus imágenes ya pagadas se reutilizan. Editar el texto de un estilo en `styles.py` solo afecta a los videos que ya lo usan (sus imágenes se regeneran la próxima vez).
 - El prompt de imagen se compone como: prompt de la escena, personajes (`Featuring:`), sufijo del estilo y sufijo de composición. Flux schnell trunca a ~256 tokens: si el prompt estima más de 230 tokens, se avisa y se recortan primero las descripciones de personajes (el estilo nunca se elimina).
+
+### Formatos de video
+Cada video tiene un **formato** del catálogo `FORMATS` en `config.py` (`vertical` o `horizontal`), que define la resolución, el tamaño de la imagen Flux, la composición que se añade a cada prompt de imagen, el texto del guionista y la geometría de subtítulos y gancho.
+```powershell
+python main.py generate --profile curiosity --topic "..." --format horizontal   # YouTube 16:9, 1920x1080
+```
+- **Resolución:** `--format` explícito > `video_format` del `script.json` en caché > `video_format` de `run_config.json` > `default_format` del perfil (solo para proyectos nuevos). Se guarda en `script.json` y en `run_config.json`; `retry-scene` usa siempre el formato del guion.
+- **Los videos existentes siguen siendo verticales:** los `script.json` y `run_config.json` antiguos (sin `video_format`) se leen como `vertical` y sus huellas de caché no cambian, así que no se vuelve a pagar nada.
+- **Cambiar el formato de un video existente** actualiza `script.json` y regenera todas las imágenes (~$0.003 cada una en modo real) y los clips; la locución y la mezcla de audio se conservan. Los guiones legados (sin estilo visual) solo admiten `vertical`: para pasarlos a horizontal indica también `--style`.
+- **Añadir un formato:** agrega una entrada a `FORMATS` en `config.py` (el tamaño Flux con lados múltiplos de 16 y hasta ~1 megapíxel).
+
+### Costos
+Precios de Fal.ai por unidad; el resumen de cada ejecución muestra el costo real (imágenes pagadas por modelo + guion).
+
+| Concepto | Modelo | Costo |
+|---|---|---|
+| Imagen, video vertical u horizontal sin protagonista | `fal-ai/flux/schnell` | ~$0.003 por imagen |
+| Imagen, proyecto con protagonista | `fal-ai/bytedance/seedream/v4.5` (edit con la referencia cuando sale el protagonista; text-to-image el resto) | $0.04 por imagen |
+| Candidata de personaje (`create-character`) | Seedream v4.5 text-to-image | $0.04 por candidata |
+| Importar imagen de personaje (`--from-image`) | - | $0.00 |
+| Guion | `openrouter/router` (`google/gemini-2.5-flash`) | ~$0.01 por guion (`usage.cost`) |
+| Locución | `edge-tts` | Gratis |
+
+- **Vertical:** ~$0.003 por imagen; un short de `curiosity` (15 a 18 escenas) ronda los $0.05 en imágenes.
+- **Con protagonista:** ≈ **$0.50–0.60 por minuto** de video (unas 12 imágenes por minuto a $0.04 cada una). Ejemplo medido: un video de 45 s con 7 imágenes costó $0.28.
+- Las imágenes servidas de la caché y los modos `--mock-*` no cuestan nada.
 
 ### Ediciones manuales
 Puedes editar `workspace/<slug>/script.json` a mano (narración, prompts, efectos de cámara) y volver a ejecutar `generate` con las mismas opciones: solo se rehacen las escenas modificadas.

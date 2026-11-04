@@ -16,6 +16,8 @@ estilo con --style; cada perfil define el suyo por defecto en profiles.py (defau
 
 from dataclasses import dataclass
 
+from config import FORMATS
+
 
 @dataclass(frozen=True)
 class VisualStyle:
@@ -27,11 +29,9 @@ class VisualStyle:
 
 
 # Composición común a todos los estilos: protege la zona del gancho (arriba), los subtítulos y la UI de la
-# plataforma (abajo), y deja margen para los efectos de zoom/paneo.
-COMPOSITION_SUFFIX = (
-    "Vertical 9:16 frame, main subject centered with clear separation from the background, "
-    "simple uncluttered top and bottom areas. No text, no letters, no captions, no logos, no watermark."
-)
+# plataforma (abajo), y deja margen para los efectos de zoom/paneo. Ahora depende del formato de video
+# (config.FORMATS[...].composition_hint); este alias es el del formato vertical.
+COMPOSITION_SUFFIX = FORMATS["vertical"].composition_hint
 
 
 STYLES: dict[str, VisualStyle] = {
@@ -128,6 +128,57 @@ STYLES: dict[str, VisualStyle] = {
             "Write each scene as a single comic panel: one clear emotional beat, expressive faces and body "
             "language, a simple readable background. Refer to characters by a short role noun. Specify the "
             "framing (close-up, medium shot, wide establishing shot) and keep speech bubbles out of frame."
+        ),
+    ),
+    # ------------------------------------------------------------------ que_pasaria / historia / chisme (protagonista recurrente)
+    "cine_realista": VisualStyle(
+        id="cine_realista",
+        label="Cine realista",
+        description="Fotograma de película fotorrealista; versátil para escenarios, aventuras y cualquier ambiente.",
+        image_suffix=(
+            "Photorealistic cinematic film still, natural motivated lighting with soft contrast, true-to-life "
+            "textures and skin detail, balanced realistic color grading, shallow depth of field, "
+            "subtle film grain, high production value."
+        ),
+        scene_guidance=(
+            "Describe ONE moment as if it were a frame from a feature film: the exact action, the character's "
+            "expression and body language, the clothing or gear if it changes, the setting and time of day, "
+            "and the shot type (wide establishing shot, medium shot, over-the-shoulder, low angle, close-up). "
+            "Favor tangible, believable details and a single visual focus. Change the location and the "
+            "lighting from scene to scene so the video never feels repetitive."
+        ),
+    ),
+    "cine_apocaliptico": VisualStyle(
+        id="cine_apocaliptico",
+        label="Cine apocalíptico",
+        description="Fotograma posapocalíptico fotorrealista; polvo, ruinas y colores apagados con acentos de fuego.",
+        image_suffix=(
+            "Photorealistic post-apocalyptic cinematic film still, drifting dust and ash, ruined crumbling "
+            "structures and abandoned wreckage, desaturated earth tones with warm fire and ember accents, "
+            "hazy shafts of sunlight, gritty textures, shallow depth of field, subtle film grain."
+        ),
+        scene_guidance=(
+            "Show the collapse of the world around the moment: ruined buildings, abandoned vehicles, "
+            "scavenged supplies, smoke, dust storms, makeshift shelters, improvised gear. State the exact "
+            "action and the emotion of the character against the scale of the devastation (wide shots work "
+            "great), the shot type and the light source (fire, embers, hazy sun, flashlight). No gore: imply "
+            "danger with silhouettes, shadows, damage and the environment."
+        ),
+    ),
+    "animacion_3d": VisualStyle(
+        id="animacion_3d",
+        label="Animación 3D",
+        description="Look de película animada 3D estilizada; personajes expresivos, color vivo y luz cálida.",
+        image_suffix=(
+            "Stylized 3D animated feature film still, expressive characters with appealing exaggerated "
+            "proportions, smooth skin and detailed fabric, rich saturated colors, soft cinematic lighting with "
+            "warm rim light, polished materials, shallow depth of field."
+        ),
+        scene_guidance=(
+            "Write each scene like a frame from an animated adventure: one clear action with an exaggerated, "
+            "readable emotion on the character's face and body, a colorful and detailed environment with depth, "
+            "and the shot type (wide establishing shot, medium shot, low angle, close-up). Favor dynamic poses "
+            "and expressive reactions, and keep the background readable behind the subject."
         ),
     ),
 }

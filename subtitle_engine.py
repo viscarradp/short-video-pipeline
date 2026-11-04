@@ -10,29 +10,19 @@ from rich.console import Console
 from config import (
     FONTS_DIR,
     HOOK_BOX_COLOR,
-    HOOK_BOX_PADDING,
-    HOOK_FONT_SIZE,
     HOOK_MAX_SEC,
-    HOOK_POS_Y_FRAC,
     HOOK_TEXT_COLOR,
     SUBTITLE_ACTIVE_COLOR,
     SUBTITLE_ACTIVE_SCALE,
     SUBTITLE_FONT_BOLD,
     SUBTITLE_FONT_FILENAME,
     SUBTITLE_FONT_NAME,
-    SUBTITLE_FONT_SIZE,
     SUBTITLE_KEYWORD_COLOR,
     SUBTITLE_LIBASS_EM_RATIO,
-    SUBTITLE_MARGIN_LR,
-    SUBTITLE_MAX_LINE_WIDTH_PX,
     SUBTITLE_NORMAL_COLOR,
-    SUBTITLE_OUTLINE,
-    SUBTITLE_POS_Y_FRAC,
-    SUBTITLE_SHADOW,
     SUBTITLE_SPACING,
     VIDEO_FPS,
-    VIDEO_HEIGHT,
-    VIDEO_WIDTH,
+    VideoFormat,
 )
 from pipeline_utils import scene_frames
 
@@ -63,11 +53,12 @@ def sanitize_ass_text(text: str) -> str:
     return text.replace("{", "(").replace("}", ")").replace("\\", "/")
 
 
-def build_ass_header(font_name: str = SUBTITLE_FONT_NAME, bold: int = SUBTITLE_FONT_BOLD) -> str:
-    """Cabecera ASS 1080x1920 con el estilo de subtítulos (ViralTikTok) y el del texto gancho (Hook).
+def build_ass_header(video_format: VideoFormat, font_name: str = SUBTITLE_FONT_NAME, bold: int = SUBTITLE_FONT_BOLD) -> str:
+    """Cabecera ASS a la resolución del formato (PlayRes = resolución del video) con el estilo de subtítulos
+    (ViralTikTok) y el del texto gancho (Hook).
 
-    Ambos estilos usan alineación central (5/8) y se posicionan con \\pos en cada evento (la zona segura está en config).
-    El Hook usa BorderStyle 3: caja opaca del color de OutlineColour con HOOK_BOX_PADDING px de relleno.
+    Ambos estilos usan alineación central (5/8) y se posicionan con \\pos en cada evento (la zona segura está en el formato).
+    El Hook usa BorderStyle 3: caja opaca del color de OutlineColour con hook_box_padding px de relleno.
     """
     return f"""[Script Info]
 Title: TikTok Viral Dynamic Subtitles
@@ -75,13 +66,13 @@ ScriptType: v4.00+
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 YCbCr Matrix: TV.709
-PlayResX: {VIDEO_WIDTH}
-PlayResY: {VIDEO_HEIGHT}
+PlayResX: {video_format.width}
+PlayResY: {video_format.height}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralTikTok,{font_name},{SUBTITLE_FONT_SIZE},{SUBTITLE_NORMAL_COLOR[:-1]},&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,1,{SUBTITLE_OUTLINE},{SUBTITLE_SHADOW},5,{SUBTITLE_MARGIN_LR},{SUBTITLE_MARGIN_LR},0,1
-Style: Hook,{font_name},{HOOK_FONT_SIZE},{HOOK_TEXT_COLOR[:-1]},&H000000FF,{HOOK_BOX_COLOR[:-1]},&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,3,{HOOK_BOX_PADDING},0,8,{SUBTITLE_MARGIN_LR},{SUBTITLE_MARGIN_LR},0,1
+Style: ViralTikTok,{font_name},{video_format.subtitle_font_size},{SUBTITLE_NORMAL_COLOR[:-1]},&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,1,{video_format.subtitle_outline},{video_format.subtitle_shadow},5,{video_format.subtitle_margin_lr},{video_format.subtitle_margin_lr},0,1
+Style: Hook,{font_name},{video_format.hook_font_size},{HOOK_TEXT_COLOR[:-1]},&H000000FF,{HOOK_BOX_COLOR[:-1]},&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,3,{video_format.hook_box_padding},0,8,{video_format.subtitle_margin_lr},{video_format.subtitle_margin_lr},0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -89,7 +80,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 # --------------------------------------------------------------------------- #
-# Medición de ancho (para partir bloques que no caben en SUBTITLE_MAX_LINE_WIDTH_PX)
+# Medición de ancho (para partir bloques que no caben en subtitle_max_line_width_px del formato)
 # --------------------------------------------------------------------------- #
 
 @lru_cache(maxsize=1)
@@ -101,21 +92,21 @@ def _measure_font() -> Optional[Any]:
         return None
 
 
-def measure_text_width(text: str, font_size: float = SUBTITLE_FONT_SIZE) -> float:
+def measure_text_width(text: str, video_format: VideoFormat) -> float:
     """Ancho estimado en px (a PlayResX) de `text` en una línea: avance de glifos + espaciado + contorno."""
     font = _measure_font()
-    em_px = font_size * SUBTITLE_LIBASS_EM_RATIO
+    em_px = video_format.subtitle_font_size * SUBTITLE_LIBASS_EM_RATIO
     if font is not None:
         advance = font.getlength(text) * em_px / 1000.0
     else:  # sin la fuente: estimación conservadora para mayúsculas
         advance = 0.78 * em_px * len(text)
-    return advance + SUBTITLE_SPACING * len(text) + 2 * SUBTITLE_OUTLINE
+    return advance + SUBTITLE_SPACING * len(text) + 2 * video_format.subtitle_outline
 
 
-def chunk_display_width(display_words: list[str]) -> float:
+def chunk_display_width(display_words: list[str], video_format: VideoFormat) -> float:
     """Ancho de un bloque en su peor caso: la línea completa más el crecimiento de la palabra activa más ancha (pop)."""
-    full = measure_text_width(" ".join(display_words))
-    widest = max((measure_text_width(w) for w in display_words), default=0.0)
+    full = measure_text_width(" ".join(display_words), video_format)
+    widest = max((measure_text_width(w, video_format) for w in display_words), default=0.0)
     return full + widest * (SUBTITLE_ACTIVE_SCALE - 100) / 100.0
 
 
@@ -148,18 +139,19 @@ def chunk_words(words: list[dict[str, Any]], max_chunk_size: int = 3) -> list[li
 def fit_chunks_to_width(
     chunks: list[list[dict[str, Any]]],
     display: Callable[[dict[str, Any]], str],
-    max_width: float = SUBTITLE_MAX_LINE_WIDTH_PX,
+    video_format: VideoFormat,
 ) -> list[list[dict[str, Any]]]:
-    """Parte los bloques cuyo ancho supera `max_width` en bloques más pequeños (de 1 a 3 palabras), de forma voraz.
+    """Parte los bloques cuyo ancho supera subtitle_max_line_width_px en bloques más pequeños (de 1 a 3 palabras), de forma voraz.
 
     Una palabra suelta nunca se parte (si aun así excede el ancho, libass la ajusta dentro de los márgenes).
     """
+    max_width = video_format.subtitle_max_line_width_px
     fitted: list[list[dict[str, Any]]] = []
     for chunk in chunks:
         current: list[dict[str, Any]] = []
         for word in chunk:
             trial = current + [word]
-            if current and chunk_display_width([display(w) for w in trial]) > max_width:
+            if current and chunk_display_width([display(w) for w in trial], video_format) > max_width:
                 fitted.append(current)
                 current = [word]
             else:
@@ -210,13 +202,20 @@ def karaoke_slices(start_ms: int, end_ms: int, word_starts: list[int]) -> list[t
     return slices
 
 
-def chunk_base_scale(display_words: list[str], max_width: float = SUBTITLE_MAX_LINE_WIDTH_PX) -> int:
+def chunk_base_scale(display_words: list[str], video_format: VideoFormat) -> int:
     """Escala (%) de todo el bloque: 100 salvo que, ya dividido, aún no quepa (una palabra larguísima): se encoge."""
-    width = chunk_display_width(display_words)
+    max_width = video_format.subtitle_max_line_width_px
+    width = chunk_display_width(display_words, video_format)
     return 100 if width <= max_width else max(int(100 * max_width / width), 40)
 
 
-def render_chunk_text(display_words: list[str], keyword_flags: list[bool], active_idx: int, base_scale: int = 100) -> str:
+def render_chunk_text(
+    display_words: list[str],
+    keyword_flags: list[bool],
+    active_idx: int,
+    video_format: VideoFormat,
+    base_scale: int = 100,
+) -> str:
     """Texto del evento: palabra activa en amarillo con pop, palabras clave en su color, el resto en blanco.
 
     `base_scale` (%) encoge todo el bloque cuando una sola palabra es más ancha que el máximo.
@@ -234,11 +233,12 @@ def render_chunk_text(display_words: list[str], keyword_flags: list[bool], activ
         else:
             parts.append(word)
     scale_tag = f"\\fscx{base_scale}\\fscy{base_scale}" if base_scale != 100 else ""
-    pos = f"{{\\an5\\pos({VIDEO_WIDTH // 2},{round(VIDEO_HEIGHT * SUBTITLE_POS_Y_FRAC)}){scale_tag}}}"
+    pos_y = round(video_format.height * video_format.subtitle_pos_y_frac)
+    pos = f"{{\\an5\\pos({video_format.width // 2},{pos_y}){scale_tag}}}"
     return pos + " ".join(parts)
 
 
-def build_karaoke_events(timing_metadata: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+def build_karaoke_events(timing_metadata: dict[str, Any], video_format: VideoFormat) -> tuple[list[dict[str, Any]], int]:
     """Eventos de subtítulos (uno por palabra activa) y duración total en ms. Nunca hay dos eventos a la vez.
 
     Cada evento: start_ms, end_ms, text, chunk (nº de bloque), active (índice de la palabra activa en el bloque).
@@ -268,7 +268,7 @@ def build_karaoke_events(timing_metadata: dict[str, Any]) -> tuple[list[dict[str
                     raw_words.append({"word": token, "start_ms": start, "end_ms": end, "duration_ms": end - start})
 
         # Bloques de 2-3 palabras, partidos si no caben en el ancho máximo
-        for chunk in fit_chunks_to_width(chunk_words(raw_words, max_chunk_size=3), display):
+        for chunk in fit_chunks_to_width(chunk_words(raw_words, max_chunk_size=3), display, video_format):
             if not chunk:
                 continue
             chunk_start_ms = cumulative_offset_ms + chunk[0]["start_ms"]
@@ -303,15 +303,17 @@ def build_karaoke_events(timing_metadata: dict[str, Any]) -> tuple[list[dict[str
             events.append({
                 "start_ms": start,
                 "end_ms": end,
-                "text": render_chunk_text(ce["display"], ce["keywords"], active, chunk_base_scale(ce["display"])),
-                "scale": chunk_base_scale(ce["display"]),
+                "text": render_chunk_text(
+                    ce["display"], ce["keywords"], active, video_format, chunk_base_scale(ce["display"], video_format)
+                ),
+                "scale": chunk_base_scale(ce["display"], video_format),
                 "chunk": chunk_idx,
                 "active": active,
             })
     return events, total_ms
 
 
-def build_hook_event(hook_text: str, timing_metadata: dict[str, Any]) -> Optional[dict[str, Any]]:
+def build_hook_event(hook_text: str, timing_metadata: dict[str, Any], video_format: VideoFormat) -> Optional[dict[str, Any]]:
     """Evento del texto gancho: de 0 al fin de la escena 1 (máx. HOOK_MAX_SEC). None si no hay texto."""
     clean = " ".join(sanitize_ass_text(hook_text or "").split()).upper()
     if not clean:
@@ -320,28 +322,29 @@ def build_hook_event(hook_text: str, timing_metadata: dict[str, Any]) -> Optiona
     scenes = timing_metadata.get("scenes", [])
     scene1_ms = round(scene_frames(scenes[0], fps) * 1000 / fps) if scenes else round(HOOK_MAX_SEC * 1000)
     end_ms = min(scene1_ms, round(HOOK_MAX_SEC * 1000))
-    top_y = round(VIDEO_HEIGHT * HOOK_POS_Y_FRAC)
-    return {"start_ms": 0, "end_ms": end_ms, "text": f"{{\\an8\\pos({VIDEO_WIDTH // 2},{top_y})}}{clean}"}
+    top_y = round(video_format.height * video_format.hook_pos_y_frac)
+    return {"start_ms": 0, "end_ms": end_ms, "text": f"{{\\an8\\pos({video_format.width // 2},{top_y})}}{clean}"}
 
 
 def generate_subtitles_ass(
     timing_metadata: dict[str, Any],
     output_ass_path: Path,
+    video_format: VideoFormat,
     font_name: str = SUBTITLE_FONT_NAME,
     hook_text: str = "",
 ) -> Path:
     """Calculate cumulative continuous timeline and produce styled karaoke ASS subtitles (+ optional hook overlay)."""
     console.print("[cyan]Generando subtítulos dinámicos estilo TikTok (.ass)...[/cyan]")
 
-    header = build_ass_header(font_name=font_name)
-    events, _total_ms = build_karaoke_events(timing_metadata)
+    header = build_ass_header(video_format, font_name=font_name)
+    events, _total_ms = build_karaoke_events(timing_metadata, video_format)
     dialogue_lines = [
         f"Dialogue: 0,{ms_to_ass_time(ev['start_ms'])},{ms_to_ass_time(ev['end_ms'])},ViralTikTok,,0,0,0,,{ev['text']}"
         for ev in events
     ]
     chunks = len({ev["chunk"] for ev in events})
 
-    hook = build_hook_event(hook_text, timing_metadata)
+    hook = build_hook_event(hook_text, timing_metadata, video_format)
     if hook:
         # Capa 1 (sobre los subtítulos); va primero para quedar ordenado por inicio
         dialogue_lines.insert(
