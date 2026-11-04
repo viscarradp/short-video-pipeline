@@ -133,11 +133,14 @@ def parse_voice_rate(rate: str) -> float:
     return float(m.group(1)) / 100.0
 
 
+def effective_words_per_sec(profile: VideoProfile) -> float:
+    """Palabras por segundo efectivas de la voz del perfil: las medidas (words_per_sec) o, si no hay, la base x (1 + velocidad)."""
+    return profile.words_per_sec or WORDS_PER_SEC_BASE * (1 + parse_voice_rate(profile.voice_rate))
+
+
 def narration_word_budget(profile: VideoProfile) -> int:
-    """Palabras objetivo por escena: duración objetivo x palabras/seg (las medidas del perfil o, si no hay, la base
-    x (1 + velocidad de la voz)), redondeado."""
-    wps = profile.words_per_sec or WORDS_PER_SEC_BASE * (1 + parse_voice_rate(profile.voice_rate))
-    words = profile.target_scene_duration_sec * wps
+    """Palabras objetivo por escena: duración objetivo x palabras/seg efectivas (ver effective_words_per_sec), redondeado."""
+    words = profile.target_scene_duration_sec * effective_words_per_sec(profile)
     return max(1, round(words))
 
 

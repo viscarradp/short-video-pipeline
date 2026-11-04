@@ -1,7 +1,8 @@
 """Professional CLI for Automated Short Video Pipeline (main.py).
 
 Comandos:
-  generate          Genera un video completo (caché por huella de contenido por escena).
+  generate          Genera un video completo (caché por huella de contenido por escena). Con --script-file
+                    en vez de escribir el guion con el LLM, importa tu propio texto como narración.
   retry-scene       Regenera escenas concretas (imagen y/o narración) y reensambla el video.
   styles            Lista los estilos visuales disponibles (opción --style de generate).
   create-character  Crea un personaje persistente (imagen de referencia) para los videos con protagonista.
@@ -16,13 +17,18 @@ import time
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+try:  # typer >= 0.20 incluye su propia copia de click (typer._click); las versiones anteriores dependen de click
+    from click.exceptions import MissingParameter
+except ImportError:
+    from typer._click.exceptions import MissingParameter
 
 from character_engine import (
     DEFAULT_CANDIDATES,
@@ -48,6 +54,15 @@ from script_engine import (
     resolve_style_id,
     write_script,
 )
+from storyboard_engine import (
+    MAX_SCENE_SECONDS,
+    MIN_SCENE_SECONDS,
+    ImportedScript,
+    estimate_import,
+    import_or_load_script,
+    prepare_import,
+    render_estimate,
+)
 from styles import STYLES
 from tts_engine import generate_tts_sync
 from image_engine import ImageOverrides, generate_images_sync
@@ -66,7 +81,8 @@ app = typer.Typer(
     help=(
         "CLI profesional para automatizar la creación de videos cortos: verticales (Shorts/Reels/TikTok, 9:16) "
         "u horizontales (YouTube, 16:9).\n\n"
-        "Comandos: 'generate' crea un video completo; 'retry-scene' regenera escenas concretas de un proyecto existente; "
+        "Comandos: 'generate' crea un video completo (o importa tu propio guion con --script-file); "
+        "'retry-scene' regenera escenas concretas de un proyecto existente; "
         "'styles' lista los estilos visuales; 'create-character' y 'characters' gestionan los personajes persistentes "
         "(protagonista con la misma cara en todas las escenas)."
     ),
@@ -110,11 +126,15 @@ class RunConfig:
     video_format: str = "vertical"  # formato de video resuelto (config.FORMATS); los run_config.json antiguos son verticales
     character: str = ""  # slug del personaje protagonista (characters/<slug>/); "" = sin protagonista
     minutes: Optional[float] = None  # duración objetivo del video (--minutes); None = la del perfil
+    # Guion importado (--script-file): hash del texto limpio, escena-segundos y nombre del archivo; None = guion escrito por el LLM.
+    # Si está, retry-scene sabe que no debe añadir la frase de cierre del perfil ni pedir el .txt original.
+    script_import: Optional[dict[str, Any]] = None
 
     def save(self, workspace: Path) -> None:
-        (workspace / RUN_CONFIG_FILENAME).write_text(
-            json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        data = asdict(self)
+        if data["script_import"] is None:
+            del data["script_import"]  # los run_config.json de proyectos no importados quedan como siempre
+        (workspace / RUN_CONFIG_FILENAME).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
     def load(cls, workspace: Path) -> "RunConfig":
@@ -133,6 +153,7 @@ class RunConfig:
                 video_format=str(data.get("video_format") or "vertical"),
                 character=str(data.get("character") or ""),
                 minutes=_as_minutes(data.get("minutes")),
+                script_import=_as_import_info(data.get("script_import")),
             )
         except (OSError, ValueError, KeyError, TypeError) as e:
             raise PipelineError(f"{RUN_CONFIG_FILENAME} es inválido o está incompleto ({e}). Ejecuta 'generate' de nuevo para recrearlo.") from e
@@ -145,6 +166,11 @@ def _as_minutes(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return minutes if minutes > 0 else None
+
+
+def _as_import_info(value: Any) -> Optional[dict[str, Any]]:
+    """Datos de importación guardados en run_config.json: un objeto no vacío, o None (proyecto no importado)."""
+    return value if isinstance(value, dict) and value else None
 
 
 def _read_run_config_raw(workspace: Path) -> dict[str, Any]:
@@ -244,11 +270,18 @@ def run_pipeline(
     env_status: dict[str, str],
     image_overrides: Optional[ImageOverrides] = None,
     persist_config: bool = False,
+    import_source: Optional[ImportedScript] = None,
+    after_script: Optional[Callable[[VideoProjectSchema, Optional[Character], CacheManifest, RunStats], None]] = None,
 ) -> PipelineResult:
     """Las 5 etapas del pipeline, compartidas por 'generate' y 'retry-scene'. Lanza PipelineError ante fallos.
 
     persist_config=True (generate) guarda run_config.json solo cuando el guion ya se generó o cargó con éxito: si esa
     etapa falla, el run_config.json anterior sigue coincidiendo con el script.json existente (retry-scene no recalcula).
+
+    Proyecto importado (config.script_import): el guion sale de storyboard_engine en vez del guionista LLM. `import_source`
+    (el texto limpio, solo en generate) decide si se rehace el storyboard; sin él (retry-scene) solo se carga script.json.
+    `after_script(proyecto, personaje, manifiesto, stats)` se llama con el guion listo y ANTES de la voz y las imágenes
+    (generate lo usa para mostrar la estimación y pedir confirmación; si lanza una excepción, no se genera nada más).
     """
     profile = get_profile(config.profile)
     manifest = CacheManifest(workspace)
@@ -257,19 +290,34 @@ def run_pipeline(
 
     # Módulo 1: Script Engine
     console.rule("[bold cyan]Módulo 1: Motor de Guión y Continuidad[/bold cyan]")
-    project = generate_or_load_script(
-        topic=config.topic,
-        profile_name=profile.name,
-        output_dir=workspace,
-        manifest=manifest,
-        force=force.script,
-        mock_script=config.mock_script,
-        stats=stats,
-        style_id=config.style,
-        format_id=config.video_format,
-        protagonist=protagonist,
-        target_minutes=config.minutes,
-    )
+    if config.script_import is not None:
+        project = import_or_load_script(
+            topic=config.topic,
+            profile=profile,
+            output_dir=workspace,
+            manifest=manifest,
+            source=import_source,
+            force=force.script,
+            mock_script=config.mock_script,
+            stats=stats,
+            style_id=config.style,
+            format_id=config.video_format,
+            protagonist=protagonist,
+        )
+    else:
+        project = generate_or_load_script(
+            topic=config.topic,
+            profile_name=profile.name,
+            output_dir=workspace,
+            manifest=manifest,
+            force=force.script,
+            mock_script=config.mock_script,
+            stats=stats,
+            style_id=config.style,
+            format_id=config.video_format,
+            protagonist=protagonist,
+            target_minutes=config.minutes,
+        )
     if protagonist is not None and project.protagonist_slug != protagonist.slug:
         console.print(
             f"[yellow]⚠ El guion en caché no usa el personaje '{protagonist.slug}' "
@@ -289,6 +337,8 @@ def run_pipeline(
     if persist_config:
         config.save(workspace)
     video_format = get_format(project.video_format)  # ya validado por generate_or_load_script
+    if after_script is not None:
+        after_script(project, protagonist, manifest, stats)
 
     # Módulo 2: Voice & Timing Engine
     console.rule("[bold cyan]Módulo 2: Motor de Voz y Tiempos al Milisegundo[/bold cyan]")
@@ -388,23 +438,50 @@ def _fmt_ids(ids: list[int]) -> str:
     return ", ".join(f"{i:02d}" for i in sorted(ids)) if ids else "ninguno"
 
 
+def _estimate_gate(
+    profile: VideoProfile, workspace: Path, scene_seconds: float, mock_images: bool, assume_yes: bool, force_images: bool = False
+) -> Callable[[VideoProjectSchema, Optional[Character], CacheManifest, RunStats], None]:
+    """Hook de run_pipeline para guiones importados: muestra la estimación (palabras, duración, escenas, imágenes por pagar y
+    costo) y pregunta antes de pagar imágenes (por defecto No). Con --yes, o si no hay nada que pagar (modo mock o todo en
+    caché), no pregunta. Si se rechaza: sale sin voz ni imágenes; el storyboard queda guardado y repetir el comando sigue desde ahí."""
+
+    def gate(project: VideoProjectSchema, protagonist: Optional[Character], manifest: CacheManifest, stats: RunStats) -> None:
+        estimate = estimate_import(project, profile, workspace, manifest, protagonist, scene_seconds, stats, force_images)
+        console.print(render_estimate(estimate, mock_images))
+        if mock_images or estimate.images_to_pay == 0:
+            return
+        if assume_yes:
+            console.print("[dim]--yes: se generan las imágenes sin preguntar.[/dim]")
+            return
+        if not typer.confirm(f"¿Generar {estimate.images_to_pay} imagen(es) por ~${estimate.images_cost_usd:.2f}?", default=False):
+            console.print(
+                "[yellow]Cancelado: no se generó ninguna imagen. El storyboard quedó guardado: vuelve a ejecutar el mismo "
+                "comando para continuar (con --yes para no preguntar, o con --mock-images para probar gratis).[/yellow]"
+            )
+            raise typer.Exit(code=1)
+
+    return gate
+
+
 # --------------------------------------------------------------------------- #
 # Comando: generate
 # --------------------------------------------------------------------------- #
 
 @app.command()
 def generate(
+    ctx: typer.Context,
     profile: str = typer.Option(
         "curiosity",
         "--profile",
         "-p",
         help=f"Perfil de contenido: {list(PROFILES.keys())}",
     ),
-    topic: str = typer.Option(
-        ...,
+    topic: Optional[str] = typer.Option(
+        None,
         "--topic",
         "-t",
-        help="Tema o premisa principal del video.",
+        help="Tema o premisa principal del video (requerido, salvo con --script-file: entonces es opcional y por defecto "
+        "es el nombre del archivo).",
     ),
     slug: Optional[str] = typer.Option(
         None,
@@ -489,10 +566,33 @@ def generate(
     minutes: Optional[float] = typer.Option(
         None,
         "--minutes",
-        help="Duración objetivo del video en minutos (ajusta el número de escenas del guion). Por defecto, la del perfil.",
+        help="Duración objetivo del video en minutos (ajusta el número de escenas del guion). Por defecto, la del perfil. "
+        "No se usa con --script-file (la duración la da tu texto).",
+    ),
+    script_file: Optional[Path] = typer.Option(
+        None,
+        "--script-file",
+        help="Importar tu propio guion (.txt en español): el texto es la narración TAL CUAL (solo se limpia el formato de chat); "
+        "el LLM únicamente hace el storyboard visual. Una línea con solo '---' fuerza un corte de escena. "
+        "Antes de pagar imágenes se muestra la estimación y se pide confirmación.",
+    ),
+    scene_seconds: Optional[float] = typer.Option(
+        None,
+        "--scene-seconds",
+        help=f"Solo con --script-file: cada cuántos segundos cambia la imagen ({MIN_SCENE_SECONDS:g} a {MAX_SCENE_SECONDS:g}); "
+        "fija las palabras por escena con la velocidad de la voz del perfil. Por defecto, la duración de escena del perfil.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Solo con --script-file: no pedir confirmación tras la estimación de costo (genera las imágenes directamente).",
     ),
 ):
     """Genera un video completo (vertical 9:16 u horizontal 16:9) con edición dinámica, SFX, BGM y subtítulos animados."""
+    if topic is None and script_file is None:
+        # Igual que cuando --topic era obligatorio: el mismo error de uso que lanza click
+        raise MissingParameter(ctx=ctx, param=next(prm for prm in ctx.command.params if prm.name == "topic"))
     start_time = time.time()
 
     force_flags = ForceFlags.all() if force else ForceFlags(force_script, force_audio, force_images, force_video)
@@ -519,6 +619,21 @@ def generate(
     if music is not None and not music.is_file():
         console.print(f"[bold red]Error:[/] el archivo de música indicado en --music no existe: {music}")
         raise typer.Exit(code=1)
+    raw_script_text = ""
+    if script_file is not None:
+        if not script_file.is_file():
+            console.print(f"[bold red]Error:[/] el archivo indicado en --script-file no existe: {script_file}")
+            raise typer.Exit(code=1)
+        try:
+            raw_script_text = script_file.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as e:
+            console.print(f"[bold red]Error:[/] no se pudo leer {script_file} como texto UTF-8: {escape(str(e))}")
+            raise typer.Exit(code=1)
+        topic = topic or script_file.stem  # el tema solo da nombre al workspace (--slug) y al run_config.json
+    elif scene_seconds is not None:
+        console.print("[bold red]Error:[/] --scene-seconds solo se usa junto con --script-file.")
+        raise typer.Exit(code=1)
+    assert topic is not None
 
     # Estilo visual: --style > guion en caché > default del perfil (se valida antes de tocar nada)
     target_slug = slug if slug else slugify(topic)
@@ -558,6 +673,28 @@ def generate(
         raise typer.Exit(code=1)
     if chosen_character is not None:
         console.print(f"[cyan]Personaje protagonista:[/] {chosen_character.name} ({chosen_character.slug})")
+
+    # Guion importado: limpieza y división en escenas por código (la duración sale del texto, no de --minutes)
+    import_source: Optional[ImportedScript] = None
+    if script_file is not None:
+        if minutes is not None:
+            console.print("[yellow]Aviso: --minutes se ignora con --script-file (la duración la da tu texto).[/yellow]")
+        target_minutes = None
+        try:
+            import_source = prepare_import(
+                raw_script_text,
+                prof_obj,
+                scene_seconds if scene_seconds is not None else prof_obj.target_scene_duration_sec,
+                chosen_character,
+                source_name=script_file.name,
+            )
+        except PipelineError as e:
+            _print_pipeline_error(e)
+            raise typer.Exit(code=1)
+        console.print(
+            f"[cyan]Guion importado:[/] {escape(script_file.name)}: {import_source.word_count} palabras -> {len(import_source.scenes)} "
+            f"escenas de ~{import_source.scene_seconds:g} s (~{import_source.target_words} palabras cada una)"
+        )
     if target_minutes is not None:
         console.print(f"[cyan]Duración objetivo:[/] {target_minutes:g} min")
 
@@ -582,10 +719,23 @@ def generate(
             video_format=format_id,
             character=character_slug,
             minutes=target_minutes,
+            script_import=import_source.run_config_info() if import_source is not None else None,
         )
 
-        # 5. Las 5 etapas
-        result = run_pipeline(project_workspace, config, force_flags, env_status, persist_config=True)
+        # 5. Las 5 etapas (con guion importado, la estimación de costo y la confirmación van tras el storyboard)
+        result = run_pipeline(
+            project_workspace,
+            config,
+            force_flags,
+            env_status,
+            persist_config=True,
+            import_source=import_source,
+            after_script=(
+                _estimate_gate(prof_obj, project_workspace, import_source.scene_seconds, mock_images, yes, force_flags.images)
+                if import_source is not None
+                else None
+            ),
+        )
     except PipelineError as e:
         _print_pipeline_error(e)
         raise typer.Exit(code=1)
@@ -603,6 +753,8 @@ def generate(
     final_format = get_format(result.project.video_format)
     table.add_row("Formato", f"{final_format.id} ({final_format.width}x{final_format.height})")
     table.add_row("Escenas", str(len(result.project.scenes)))
+    if import_source is not None:
+        table.add_row("Guion importado", f"{escape(script_file.name)} ({import_source.word_count} palabras; narración sin cambios)")
     table.add_row("Duración Total", f"{result.timing_metadata.get('total_duration_sec', 0):.2f} segundos ({result.timing_metadata.get('total_frames', 0)} fotogramas)")
     if result.project.protagonist_slug:
         table.add_row("Protagonista", result.project.protagonist_slug)
@@ -711,7 +863,8 @@ def retry_scene(
             project = VideoProjectSchema.model_validate_json(script_path.read_text(encoding="utf-8"))
         except Exception as e:
             raise PipelineError(f"script.json de '{slug}' no es válido: {e}") from e
-        light_normalize_project(project, get_profile(config.profile))  # ids 1..N, igual que el pipeline
+        # ids 1..N, igual que el pipeline (un guion importado no recibe la frase de cierre del perfil)
+        light_normalize_project(project, get_profile(config.profile), ensure_cta=config.script_import is None)
         config.style = project.visual_style_id  # retry-scene siempre usa el estilo y el formato del guion
         config.video_format = project.video_format
         existing_ids = [sc.scene_id for sc in project.scenes]
@@ -745,6 +898,8 @@ def retry_scene(
             write_script(project, script_path)
             console.print(f"[green]✓ script.json actualizado (escena {scene_ids[0]:02d}).[/green]")
 
+        if config.script_import is not None:
+            console.print("[dim]Proyecto de guion importado: se usa script.json (no hace falta el .txt original ni se llama al LLM).[/dim]")
         console.print(
             f"[cyan]Escenas a rehacer:[/] {_fmt_ids(scene_ids)} | "
             f"[cyan]re-roll de imagen:[/] {_fmt_ids(reroll_ids)}"

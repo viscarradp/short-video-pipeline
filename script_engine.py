@@ -667,13 +667,13 @@ def append_cta(narration: str, cta: str) -> str:
     return f"{base}{sep}{cta}"
 
 
-def light_normalize_project(project: VideoProjectSchema, profile: VideoProfile) -> bool:
+def light_normalize_project(project: VideoProjectSchema, profile: VideoProfile, ensure_cta: bool = True) -> bool:
     """Normalización ligera (también para guiones en caché o editados a mano): sin validar el nº de escenas.
 
     Renumera scene_id 1..N, fuerza el perfil, normaliza hashtags/textos de publicación y garantiza la frase de
     cierre del perfil (si existe) al final de la última narración. NO toca global_visual_style ni visual_style_id:
     el estilo de un guion existente es suyo (los prompts de imagen ya pagados dependen de él). Devuelve True si
-    algo cambió.
+    algo cambió. `ensure_cta=False` (guiones importados: la narración es del autor) no toca ninguna narración.
     """
     before = project.model_dump()
     project.profile = profile.name
@@ -683,7 +683,7 @@ def light_normalize_project(project: VideoProjectSchema, profile: VideoProfile) 
     project.post_description = " ".join(project.post_description.split())
     project.hashtags = normalize_hashtags(project.hashtags)
     cta = profile.ending_call_to_action
-    if cta and project.scenes and not ends_with_cta(project.scenes[-1].narration_es, cta):
+    if ensure_cta and cta and project.scenes and not ends_with_cta(project.scenes[-1].narration_es, cta):
         project.scenes[-1].narration_es = append_cta(project.scenes[-1].narration_es, cta)
     return project.model_dump() != before
 
@@ -701,9 +701,8 @@ def sync_protagonist(project: VideoProjectSchema, protagonist: Any) -> bool:
     return before != (project.protagonist_slug, project.characters)
 
 
-def enforce_protagonist_scenes(project: VideoProjectSchema, protagonist: Any) -> None:
-    """Unifica los IDs con que el LLM etiquetó al protagonista (-> PROTAGONIST_ID, sin duplicados) y exige que salga en
-    suficientes escenas; si no, lanza ValueError (el reintento le explica el problema al LLM)."""
+def canonicalize_protagonist_ids(project: VideoProjectSchema, protagonist: Any) -> None:
+    """Unifica los IDs con que el LLM etiquetó al protagonista (PROTAGONIST_ID, slug o nombre -> PROTAGONIST_ID, sin duplicados)."""
     aliases = {PROTAGONIST_ID, protagonist.slug.lower(), protagonist.name.strip().lower()}
     for scene in project.scenes:
         ids: list[str] = []
@@ -712,6 +711,12 @@ def enforce_protagonist_scenes(project: VideoProjectSchema, protagonist: Any) ->
             if canonical not in ids:
                 ids.append(canonical)
         scene.characters_in_scene = ids
+
+
+def enforce_protagonist_scenes(project: VideoProjectSchema, protagonist: Any) -> None:
+    """Unifica los IDs con que el LLM etiquetó al protagonista y exige que salga en suficientes escenas; si no, lanza
+    ValueError (el reintento le explica el problema al LLM)."""
+    canonicalize_protagonist_ids(project, protagonist)
     n_total = len(project.scenes)
     n_with = sum(1 for sc in project.scenes if PROTAGONIST_ID in sc.characters_in_scene)
     if n_total and n_with / n_total < PROTAGONIST_MIN_SCENE_FRACTION:
@@ -720,6 +725,50 @@ def enforce_protagonist_scenes(project: VideoProjectSchema, protagonist: Any) ->
             f"en al menos el {PROTAGONIST_MIN_SCENE_FRACTION:.0%} (lo ideal es 70 % o más). Incluye \"{PROTAGONIST_ID}\" en "
             "'characters_in_scene' de cada escena donde se vea y no lo definas en 'characters'"
         )
+
+
+# Escenas SIN el protagonista (video con protagonista): el generador de imágenes de texto a imagen inventa gente al azar si el
+# prompt no lo prohíbe (y el estilo pide "expressive characters"), así que el prompt debe decir "no people" explícitamente.
+NO_PEOPLE_PHRASE = "No people, no characters."
+_NO_PEOPLE_RE = re.compile(r"\b(?:no|zero|without|devoid of)\s+(?:any\s+)?(?:people|characters|humans?|persons?|figures?|one)\b|\bnobody\b|\buninhabited\b", re.IGNORECASE)
+# Palabras que delatan que el prompt SÍ describe gente (una multitud de fondo, un personaje de rol...): no se le añade "no people"
+_PEOPLE_WORDS_RE = re.compile(
+    r"\b(?:people|persons?|men|man|women|woman|boys?|girls?|child(?:ren)?|kids?|crowds?|humans?|humanity|humankind|figures?|"
+    r"silhouettes?|famil(?:y|ies)|workers?|scientists?|survivors?|villagers?|citizens?|pedestrians?|tourists?|passengers?|"
+    r"drivers?|farmers?|couples?|neighbou?rs?|guests?|strangers?|characters?|population|someone|somebody|everyone|"
+    r"riders?|hikers?|soldiers?|doctors?|nurses?|students?|teams?|groups?|pilots?|astronauts?|explorers?|nomads?|"
+    r"settlers?|travell?ers?|inhabitants?|residents?|vendors?|hunters?|dancers?|players?|swimmers?)\b",
+    re.IGNORECASE,
+)
+
+
+def ensure_no_people_without_protagonist(project: VideoProjectSchema) -> int:
+    """Red de seguridad del prompt del LLM: añade "No people, no characters." al 'visual_prompt_en' de cada escena sin el
+    protagonista que no lo dice y tampoco describe gente. No toca las escenas con algún personaje en 'characters_in_scene'
+    (el secundario definido) ni las que ya hablan de personas (una multitud de fondo que la narración exige). Devuelve
+    cuántas escenas cambió."""
+    changed = 0
+    for scene in project.scenes:
+        if scene.characters_in_scene:
+            continue
+        prompt = scene.visual_prompt_en.strip()
+        if not prompt or _NO_PEOPLE_RE.search(prompt) or _PEOPLE_WORDS_RE.search(prompt):
+            continue
+        scene.visual_prompt_en = f"{prompt if prompt[-1] in '.!?…' else prompt + '.'} {NO_PEOPLE_PHRASE}"
+        changed += 1
+    return changed
+
+
+def filter_highlight_words(project: VideoProjectSchema) -> None:
+    """Deja en cada escena solo las palabras clave que aparecen en su narración (los subtítulos las buscan ahí)."""
+    for scene in project.scenes:
+        narration_tokens = set(_word_tokens(scene.narration_es))
+        kept: list[str] = []
+        for hw in scene.highlight_words:
+            hw_tokens = _word_tokens(hw)
+            if hw_tokens and all(t in narration_tokens for t in hw_tokens):
+                kept.append(hw)
+        scene.highlight_words = kept
 
 
 def normalize_project(
@@ -750,19 +799,12 @@ def normalize_project(
     if protagonist is not None:
         sync_protagonist(project, protagonist)
         enforce_protagonist_scenes(project, protagonist)
+        ensure_no_people_without_protagonist(project)
     else:
         project.protagonist_slug = ""  # lo fija solo el código
 
     light_normalize_project(project, profile)
-
-    for scene in project.scenes:
-        narration_tokens = set(_word_tokens(scene.narration_es))
-        kept: list[str] = []
-        for hw in scene.highlight_words:
-            hw_tokens = _word_tokens(hw)
-            if hw_tokens and all(t in narration_tokens for t in hw_tokens):
-                kept.append(hw)
-        scene.highlight_words = kept
+    filter_highlight_words(project)
 
     return project
 
@@ -855,14 +897,16 @@ def llm_max_tokens(profile: VideoProfile) -> int:
     return min(LLM_MAX_TOKENS_BASE + LLM_MAX_TOKENS_PER_SCENE * profile.target_scenes_max, LLM_MAX_TOKENS_CAP)
 
 
-def build_llm_arguments(system_prompt: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
+def build_llm_arguments(
+    system_prompt: str, user_prompt: str, max_tokens: int, temperature: float = LLM_TEMPERATURE
+) -> dict[str, Any]:
     """Argumentos de openrouter/router. 'reasoning' se deja en su valor por defecto (apagado): el JSON no lo necesita y
     los tokens de razonamiento se cobran como salida."""
     return {
         "model": LLM_MODEL,
         "prompt": user_prompt,
         "system_prompt": system_prompt,
-        "temperature": LLM_TEMPERATURE,
+        "temperature": temperature,
         "max_tokens": max_tokens,
     }
 
@@ -888,6 +932,76 @@ def extract_llm_output(res: Any) -> str:
     if not isinstance(output, str) or not output.strip():
         raise ValueError(f"{LLM_ENDPOINT} devolvió respuesta vacía")
     return output
+
+
+def load_cached_project(
+    script_path: Path,
+    profile: VideoProfile,
+    protagonist: Optional[Any] = None,
+    style_id: str = "",
+    format_id: str = "",
+    ensure_cta: bool = True,
+) -> VideoProjectSchema:
+    """Carga y normaliza el script.json en caché, respetando las ediciones manuales (nunca llama al LLM).
+
+    Aplica la normalización ligera, sincroniza el protagonista con la biblioteca y, si `style_id` / `format_id` difieren
+    de los guardados, los actualiza avisando del costo (las imágenes se regeneran porque su prompt compuesto cambia).
+    Reescribe script.json solo si algo cambió. Lanza PipelineError si el formato o el estilo no son válidos."""
+    with open(script_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    project = VideoProjectSchema.model_validate(data)
+    changed = light_normalize_project(project, profile, ensure_cta=ensure_cta)
+    if protagonist is not None:
+        n_with = sum(1 for sc in project.scenes if PROTAGONIST_ID in sc.characters_in_scene)
+        if sync_protagonist(project, protagonist):
+            changed = True
+            console.print(
+                f"[yellow]⚠ La descripción del protagonista '{protagonist.slug}' en la biblioteca cambió respecto "
+                f"a la del guion: se actualizó script.json. En modo real se regenerarán las imágenes de las "
+                f"{n_with} escenas donde aparece, porque su prompt compuesto cambia.[/yellow]"
+            )
+    # Costo por imagen del proyecto: Seedream en todas las escenas si hay protagonista; Flux schnell si no
+    image_cost = SEEDREAM_COST_USD if project.protagonist_slug else FLUX_COST_USD
+    if style_id and style_id != project.visual_style_id:
+        new_style = get_style(style_id)
+        previous = project.visual_style_id or "legado"
+        project.visual_style_id = new_style.id
+        project.global_visual_style = new_style.image_suffix  # informativo
+        changed = True
+        n = len(project.scenes)
+        console.print(
+            f"[yellow]⚠ Estilo visual cambiado de '{previous}' a '{new_style.id}'. En modo real se "
+            f"regenerarán las {n} imágenes (~${n * image_cost:.2f}, unos ${image_cost:g} cada una) "
+            "porque el prompt compuesto cambia. Los 'visual_prompt_en' existentes se escribieron para el "
+            "estilo anterior: usa --force-script para reescribirlos (también regenera imágenes).[/yellow]"
+        )
+    if format_id and format_id != project.video_format:
+        new_format = get_format(format_id)
+        if not project.visual_style_id and new_format.id != "vertical":
+            # Los guiones legados componen el prompt con "vertical 9:16" fijo (ver compose_scene_prompt_legacy)
+            raise PipelineError(
+                f"El guion de {script_path.parent.name} es legado (sin estilo visual) y solo admite el formato "
+                f"vertical. Para pasarlo a '{new_format.id}' indica también --style <id> (regenera sus imágenes)."
+            )
+        previous = project.video_format
+        project.video_format = new_format.id
+        changed = True
+        n = len(project.scenes)
+        console.print(
+            f"[yellow]⚠ Formato de video cambiado de '{previous}' a '{new_format.id}'. En modo real se "
+            f"regenerarán las {n} imágenes (~${n * image_cost:.2f}, unos ${image_cost:g} cada una) y se "
+            "re-renderizarán los clips y el video final, porque el prompt, el tamaño de imagen y la geometría "
+            "cambian. Los 'visual_prompt_en' existentes se escribieron para el encuadre anterior: usa "
+            "--force-script para reescribirlos (también regenera imágenes).[/yellow]"
+        )
+    try:
+        get_format(project.video_format)
+    except ValueError as e:
+        raise PipelineError(f"script.json: {e}") from e
+    if changed:
+        _write_script(project, script_path)
+        console.print("  [dim]script.json normalizado / actualizado y reescrito.[/dim]")
+    return project
 
 
 def generate_or_load_script(
@@ -956,60 +1070,7 @@ def generate_or_load_script(
                 console.print("[yellow]Aviso: el script.json existente no es de demostración; se regenerará como guion --mock-script.[/yellow]")
         if recorded == fp:
             try:
-                with open(script_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                project = VideoProjectSchema.model_validate(data)
-                changed = light_normalize_project(project, profile)
-                if protagonist is not None:
-                    n_with = sum(1 for sc in project.scenes if PROTAGONIST_ID in sc.characters_in_scene)
-                    if sync_protagonist(project, protagonist):
-                        changed = True
-                        console.print(
-                            f"[yellow]⚠ La descripción del protagonista '{protagonist.slug}' en la biblioteca cambió respecto "
-                            f"a la del guion: se actualizó script.json. En modo real se regenerarán las imágenes de las "
-                            f"{n_with} escenas donde aparece, porque su prompt compuesto cambia.[/yellow]"
-                        )
-                # Costo por imagen del proyecto: Seedream en todas las escenas si hay protagonista; Flux schnell si no
-                image_cost = SEEDREAM_COST_USD if project.protagonist_slug else FLUX_COST_USD
-                if style_id and style_id != project.visual_style_id:
-                    new_style = get_style(style_id)
-                    previous = project.visual_style_id or "legado"
-                    project.visual_style_id = new_style.id
-                    project.global_visual_style = new_style.image_suffix  # informativo
-                    changed = True
-                    n = len(project.scenes)
-                    console.print(
-                        f"[yellow]⚠ Estilo visual cambiado de '{previous}' a '{new_style.id}'. En modo real se "
-                        f"regenerarán las {n} imágenes (~${n * image_cost:.2f}, unos ${image_cost:g} cada una) "
-                        "porque el prompt compuesto cambia. Los 'visual_prompt_en' existentes se escribieron para el "
-                        "estilo anterior: usa --force-script para reescribirlos (también regenera imágenes).[/yellow]"
-                    )
-                if format_id and format_id != project.video_format:
-                    new_format = get_format(format_id)
-                    if not project.visual_style_id and new_format.id != "vertical":
-                        # Los guiones legados componen el prompt con "vertical 9:16" fijo (ver compose_scene_prompt_legacy)
-                        raise PipelineError(
-                            f"El guion de {script_path.parent.name} es legado (sin estilo visual) y solo admite el formato "
-                            f"vertical. Para pasarlo a '{new_format.id}' indica también --style <id> (regenera sus imágenes)."
-                        )
-                    previous = project.video_format
-                    project.video_format = new_format.id
-                    changed = True
-                    n = len(project.scenes)
-                    console.print(
-                        f"[yellow]⚠ Formato de video cambiado de '{previous}' a '{new_format.id}'. En modo real se "
-                        f"regenerarán las {n} imágenes (~${n * image_cost:.2f}, unos ${image_cost:g} cada una) y se "
-                        "re-renderizarán los clips y el video final, porque el prompt, el tamaño de imagen y la geometría "
-                        "cambian. Los 'visual_prompt_en' existentes se escribieron para el encuadre anterior: usa "
-                        "--force-script para reescribirlos (también regenera imágenes).[/yellow]"
-                    )
-                try:
-                    get_format(project.video_format)
-                except ValueError as e:
-                    raise PipelineError(f"script.json: {e}") from e
-                if changed:
-                    _write_script(project, script_path)
-                    console.print("  [dim]script.json normalizado / actualizado y reescrito.[/dim]")
+                project = load_cached_project(script_path, profile, protagonist, style_id, format_id)
                 if legacy_mock_marker.exists():
                     legacy_mock_marker.unlink()
                 console.print(f"[green]✓ Guion en caché:[/] {script_path} ({len(project.scenes)} escenas)")

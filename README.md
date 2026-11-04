@@ -39,6 +39,7 @@ Herramienta CLI modular y profesional en Python para automatizar el 100% de la c
    - Mezcla de audio como etapa propia (`audio/mix_final.wav`) normalizada a **-14 LUFS** con `loudnorm` de dos pasadas (techo -1.5 dBTP).
    - Línea de tiempo exacta por fotogramas: cada escena dura un número entero de fotogramas y su audio un número entero de muestras (1 fotograma = 1600 muestras a 48 kHz), así cortes, whooshes y subtítulos no se desfasan.
    - Generación de `post_metadata.txt` con el título, la descripción y los hashtags del guion (con respaldo estático si faltan) más etiquetas de alcance (#shorts #fyp #parati en vertical; ninguna en horizontal, según `reach_hashtags` de cada formato).
+8. **Guion Propio (`--script-file`):** importa tu texto como narración palabra por palabra (limpieza de formato, escenas partidas por código, storyboard visual con el LLM, estimación de costo antes de pagar imágenes). Ver *Importar tu propio guion*.
 
 ---
 
@@ -103,9 +104,34 @@ python main.py generate --profile que_pasaria --topic "¿Qué pasaría si desper
 ```
 Si no te gusta la candidata elegida, `python main.py create-character max --choose 2` cambia la referencia sin pagar nada.
 
+### 5. Importar tu propio guion
+Si ya tienes la narración (la escribiste tú o la pulíste en tu chat con Claude/Gemini), la herramienta la convierte en video **sin reescribirla**: tu texto es la locución palabra por palabra y el LLM solo decide qué imagen va en cada escena y redacta el título, el gancho y los hashtags.
+```powershell
+python main.py generate --script-file examples/guion_ejemplo_max.txt --profile que_pasaria --character demo-max --scene-seconds 5
+python main.py generate --script-file guion.txt --profile que_pasaria --character demo-max --mock-script --mock-images   # prueba gratis
+```
+- **Cómo escribir el texto:** texto plano UTF-8 en español, pensado para oírse: frases cortas, hechos concretos con cifras o fechas, un hilo claro (gancho, escalada, giro, cierre). Nombra al protagonista en el texto cuando actúe; el storyboard lo pone además como guía del espectador en el 70 % o más de las escenas (también en las de datos o explicaciones: lo señala, lo demuestra o reacciona), salvo unos pocos planos épicos. Las escenas sin él piden `no people, no characters` para que el generador de imágenes no invente personas. Los títulos (`# Guion`), los rótulos cortos en negrita o de sección (`**Escena 1**`, `Escena 3: El apagón`) y los prefijos `Narrador:` se descartan solos, con aviso; cualquier otra línea se narra. Hay un ejemplo en `examples/guion_ejemplo_max.txt`.
+- **No se añade nada:** ni gancho ni la frase de cierre del perfil (si quieres un "Suscríbete para...", escríbelo en tu texto), ni presupuesto de palabras. `--topic` es opcional (por defecto, el nombre del archivo; solo da nombre a la carpeta de `workspace/`).
+- **Limpieza automática** (un único aviso amarillo dice qué se quitó): formato Markdown de los chats (`#`, `**`, `_`, `>`, viñetas), emojis y acotaciones entre (paréntesis) o [corchetes]. Se conserva la puntuación española (¿ ¡ … — « »). Los párrafos sin punto final reciben uno para que la voz haga la pausa. Una línea con solo `---` fuerza un corte de escena. Si el nombre del protagonista no aparece en el texto, se avisa.
+- **Escenas:** las parte el código, nunca el LLM, así que la narración no puede cambiar: primero en frases (sin cortar en decimales, `Sr.`, `Dra.`, `etc.`) y luego se agrupan hacia ~N palabras por escena (de ~55 % a ~145 % de N), cortando en comas o antes de "y", "pero", "porque"... si una frase es larga. `--scene-seconds` (por defecto, la duración de escena del perfil, 5 s) fija cada cuánto cambia la imagen: N = segundos x palabras por segundo de la voz (~15 palabras con 5 s).
+- **Cuánto texto:** a +40 % (voz de `que_pasaria`, `historia` y `chisme`) se leen unas 2.95 palabras por segundo, ~175 por minuto:
+
+| Duración | Palabras | Escenas (5 s) | Imágenes con protagonista (~$0.04) |
+|---|---|---|---|
+| 30 s | ~90 | 6 | ~$0.24 |
+| 1 min | ~175 | 12 | ~$0.48 |
+| 2 min | ~350 | 24 | ~$0.96 |
+| 3 min | ~525 | 36 | ~$1.44 |
+| 5 min | ~875 | 60 | ~$2.40 |
+
+- **Estimación y confirmación:** con el guion ya listo y antes de la voz y de pagar imágenes, se muestra un panel con las palabras, la duración estimada (palabras / palabras por segundo del perfil; suele quedar algo por encima de la real), las escenas, las imágenes por pagar (las ya en caché no cuentan), el costo por imagen y el total, y se pregunta `[y/N]` (por defecto No). `--yes` no pregunta; con `--mock-images`, o si no hay nada que pagar, tampoco. Si dices que no, no se genera ninguna imagen y el storyboard queda guardado: repetir el comando continúa desde ahí.
+- **Caché:** se guarda una copia del texto limpio en `workspace/<slug>/source_script.txt` y `run_config.json` recuerda que es un proyecto importado. Repetir el mismo comando no llama al LLM ni regenera nada. La huella del guion es el texto limpio + perfil + protagonista + `--scene-seconds` + la versión del storyboard: si cambias el texto, se rehace el storyboard (aviso amarillo) y, como los prompts visuales nuevos regeneran sus imágenes, lo normal es volver a pagar casi todas (el panel de estimación te lo muestra antes). Editar a mano `script.json` se respeta como siempre.
+- **`retry-scene` en un proyecto importado** funciona sin el `.txt` original y nunca llama al LLM del storyboard: usa `script.json` (con `--narration` o `--prompt` corriges una escena y no se añade ninguna frase de cierre).
+- **Textos largos:** hasta ~40 escenas el storyboard es una sola llamada; con más, una llamada global (título, publicación, personajes secundarios) y luego bloques de ~40 escenas que reciben los mismos personajes (los secundarios se mantienen entre bloques).
+
 ### Opciones de `generate`
 - `--profile`, `-p`: `curiosity`, `micronovela`, `que_pasaria`, `historia` o `chisme` (ver *Características*).
-- `--topic`, `-t`: Tema del video (requerido).
+- `--topic`, `-t`: Tema del video (requerido, salvo con `--script-file`).
 - `--slug`, `-s`: Nombre de la carpeta en `./workspace/`.
 - `--mock-script`: Guion de demostración local en lugar de Fal.ai (no respeta el tema).
 - `--mock-images`, `-m`: Imágenes de prueba con Pillow en lugar de Flux.
@@ -113,7 +139,10 @@ Si no te gusta la candidata elegida, `python main.py create-character max --choo
 - `--style`: Estilo visual (ver `python main.py styles` y la sección *Estilos visuales*). Por defecto, el del guion en caché o el del perfil.
 - `--format`: `vertical` (1080x1920, Shorts/Reels/TikTok) o `horizontal` (1920x1080, YouTube); ver *Formatos de video*. Por defecto, el del proyecto existente o el `default_format` del perfil.
 - `--character`: Slug de un personaje de la biblioteca (ver *Biblioteca de personajes*). Obligatorio en `que_pasaria`, `historia` y `chisme`; con protagonista las imágenes usan Seedream v4.5 (~$0.04 c/u) en lugar de Flux.
-- `--minutes`: Duración objetivo en minutos (de 0.5 a 15); ajusta el número de escenas del guion. Por defecto, la del perfil.
+- `--minutes`: Duración objetivo en minutos (de 0.5 a 15); ajusta el número de escenas del guion. Por defecto, la del perfil. No se usa con `--script-file`.
+- `--script-file`: Importa tu propio guion (`.txt`): es la narración tal cual y el LLM solo hace el storyboard visual (ver *Importar tu propio guion*).
+- `--scene-seconds`: Solo con `--script-file`: cada cuántos segundos cambia la imagen (2 a 20). Por defecto, la duración de escena del perfil.
+- `--yes`, `-y`: Solo con `--script-file`: no pedir confirmación tras la estimación de costo.
 - `--music`: Ruta a una pista de música de fondo (`.mp3`, `.m4a` o `.wav`). Sin esta opción se elige una de `assets/music/`.
 - `--force`, `-f`: Ignorar la caché de **todas** las etapas.
 - `--force-script`: Regenerar solo el guion. Ojo: un guion nuevo suele traer prompts nuevos, es decir, **volver a pagar las imágenes**.
@@ -200,6 +229,7 @@ Precios de Fal.ai por unidad; el resumen de cada ejecución muestra el costo rea
 | Candidata de personaje (`create-character`) | Seedream v4.5 text-to-image | $0.04 por candidata |
 | Importar imagen de personaje (`--from-image`) | - | $0.00 |
 | Guion | `openrouter/router` (`google/gemini-2.5-flash`) | ~$0.01 por guion (`usage.cost`) |
+| Storyboard de un guion importado | `openrouter/router` (`google/gemini-2.5-flash`) | ~$0.006 con 17 escenas; ~$0.03 con ~100 escenas |
 | Locución | `edge-tts` | Gratis |
 
 - **Vertical:** ~$0.003 por imagen; un short de `curiosity` (15 a 18 escenas) ronda los $0.05 en imágenes.
