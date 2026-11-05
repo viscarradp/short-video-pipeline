@@ -181,6 +181,22 @@ STYLES: dict[str, VisualStyle] = {
             "and expressive reactions, and keep the background readable behind the subject."
         ),
     ),
+    "cartoon_caricatura": VisualStyle(
+        id="cartoon_caricatura",
+        label="Dibujo y Caricatura",
+        description="Ilustración caricaturesca divertida; trazos limpios de tinta, colores vivos y expresiones cómicas.",
+        image_suffix=(
+            "Vibrant modern cartoon illustration, expressive caricature style with funny exaggerated emotions, "
+            "bold clean ink outlines, bright playful colors, flat cel shading, humorous comic art, crisp 2D details, "
+            "dynamic composition, no text."
+        ),
+        scene_guidance=(
+            "Describe the scene as a funny, lively cartoon drawing: exaggerated comic facial expressions, "
+            "humorous body language, dynamic character gestures, clear and colorful props. Show funny visual metaphors "
+            "(e.g. someone clutching their stomach in panic, cartoon bacteria wearing tiny villain capes, a glowing freezer). "
+            "Keep the action clear, funny, and easy to read at a glance."
+        ),
+    ),
 }
 
 
