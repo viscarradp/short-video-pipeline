@@ -57,7 +57,8 @@ def build_ass_header(video_format: VideoFormat, font_name: str = SUBTITLE_FONT_N
     """Cabecera ASS a la resolución del formato (PlayRes = resolución del video) con el estilo de subtítulos
     (ViralTikTok) y el del texto gancho (Hook).
 
-    Ambos estilos usan alineación central (5/8) y se posicionan con \\pos en cada evento (la zona segura está en el formato).
+    ViralTikTok usa alineación inferior-central (2) con MarginV = subtitle_margin_v del formato; el Hook, superior-central (8).
+    Ambos se posicionan además con \\pos en cada evento (la zona segura está en el formato).
     El Hook usa BorderStyle 3: caja opaca del color de OutlineColour con hook_box_padding px de relleno.
     """
     return f"""[Script Info]
@@ -71,7 +72,7 @@ PlayResY: {video_format.height}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralTikTok,{font_name},{video_format.subtitle_font_size},{SUBTITLE_NORMAL_COLOR[:-1]},&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,1,{video_format.subtitle_outline},{video_format.subtitle_shadow},5,{video_format.subtitle_margin_lr},{video_format.subtitle_margin_lr},0,1
+Style: ViralTikTok,{font_name},{video_format.subtitle_font_size},{SUBTITLE_NORMAL_COLOR[:-1]},&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,1,{video_format.subtitle_outline},{video_format.subtitle_shadow},2,{video_format.subtitle_margin_lr},{video_format.subtitle_margin_lr},{video_format.subtitle_margin_v},1
 Style: Hook,{font_name},{video_format.hook_font_size},{HOOK_TEXT_COLOR[:-1]},&H000000FF,{HOOK_BOX_COLOR[:-1]},&H80000000,{bold},0,0,0,100,100,{SUBTITLE_SPACING},0,3,{video_format.hook_box_padding},0,8,{video_format.subtitle_margin_lr},{video_format.subtitle_margin_lr},0,1
 
 [Events]
@@ -110,15 +111,28 @@ def chunk_display_width(display_words: list[str], video_format: VideoFormat) -> 
     return full + widest * (SUBTITLE_ACTIVE_SCALE - 100) / 100.0
 
 
-def chunk_words(words: list[dict[str, Any]], max_chunk_size: int = 3) -> list[list[dict[str, Any]]]:
-    """Group words into high-retention blocks of 2 to 3 words maximum."""
+def chunk_words(words: list[dict[str, Any]], max_chunk_size: int = 3, min_chunk_size: int = 2) -> list[list[dict[str, Any]]]:
+    """Agrupa las palabras en bloques de `min_chunk_size` a `max_chunk_size` palabras.
+
+    Con máximos de hasta 3 (vertical: 2-3 palabras): grupos de 2, sin dejar una palabra suelta al final. Con máximos
+    mayores (horizontal: 5-7): reparte las palabras en el menor número de bloques de tamaño parejo que respeta el máximo
+    (11 palabras -> 6 + 5); si hay menos que `min_chunk_size`, queda un solo bloque."""
     if not words:
         return []
 
-    chunks: list[list[dict[str, Any]]] = []
-    i = 0
     total = len(words)
+    chunks: list[list[dict[str, Any]]] = []
+    if max_chunk_size > 3:
+        n_chunks = max(-(-total // max_chunk_size), 1)
+        base, extra = divmod(total, n_chunks)
+        i = 0
+        for k in range(n_chunks):
+            take = base + (1 if k < extra else 0)
+            chunks.append(words[i : i + take])
+            i += take
+        return chunks
 
+    i = 0
     while i < total:
         remaining = total - i
         # If remaining is 4, prefer two 2-word chunks rather than 3 then 1
@@ -127,13 +141,22 @@ def chunk_words(words: list[dict[str, Any]], max_chunk_size: int = 3) -> list[li
         elif remaining <= max_chunk_size:
             take = remaining
         else:
-            take = 2  # default to punchy 2-word groups
-
-        chunk = words[i : i + take]
-        chunks.append(chunk)
+            take = max(min_chunk_size, 2)  # default to punchy 2-word groups
+        chunks.append(words[i : i + take])
         i += take
 
     return chunks
+
+
+def _balanced_split(chunk: list[dict[str, Any]], parts: int) -> list[list[dict[str, Any]]]:
+    """Parte `chunk` en `parts` trozos consecutivos de tamaño parejo (los primeros, uno más grande si no es exacto)."""
+    base, extra = divmod(len(chunk), parts)
+    result, i = [], 0
+    for k in range(parts):
+        take = base + (1 if k < extra else 0)
+        result.append(chunk[i : i + take])
+        i += take
+    return result
 
 
 def fit_chunks_to_width(
@@ -141,23 +164,23 @@ def fit_chunks_to_width(
     display: Callable[[dict[str, Any]], str],
     video_format: VideoFormat,
 ) -> list[list[dict[str, Any]]]:
-    """Parte los bloques cuyo ancho supera subtitle_max_line_width_px en bloques más pequeños (de 1 a 3 palabras), de forma voraz.
+    """Parte los bloques cuyo ancho supera subtitle_max_line_width_px en el menor número de bloques parejos que sí caben
+    (en el peor caso, palabras sueltas), sin dejar una palabra huérfana si se puede evitar.
 
     Una palabra suelta nunca se parte (si aun así excede el ancho, libass la ajusta dentro de los márgenes).
     """
     max_width = video_format.subtitle_max_line_width_px
     fitted: list[list[dict[str, Any]]] = []
     for chunk in chunks:
-        current: list[dict[str, Any]] = []
-        for word in chunk:
-            trial = current + [word]
-            if current and chunk_display_width([display(w) for w in trial], video_format) > max_width:
-                fitted.append(current)
-                current = [word]
-            else:
-                current = trial
-        if current:
-            fitted.append(current)
+        if not chunk:
+            continue
+        for parts in range(1, len(chunk) + 1):
+            pieces = _balanced_split(chunk, parts)
+            if parts == len(chunk) or all(
+                chunk_display_width([display(w) for w in piece], video_format) <= max_width for piece in pieces
+            ):
+                fitted.extend(pieces)
+                break
     return fitted
 
 
@@ -209,32 +232,49 @@ def chunk_base_scale(display_words: list[str], video_format: VideoFormat) -> int
     return 100 if width <= max_width else max(int(100 * max_width / width), 40)
 
 
+POP_IN_START_PERCENT = 80  # escala inicial (%) de la animación de aparición de un bloque
+
+
 def render_chunk_text(
     display_words: list[str],
     keyword_flags: list[bool],
     active_idx: int,
     video_format: VideoFormat,
     base_scale: int = 100,
+    pop_in: bool = False,
 ) -> str:
     """Texto del evento: palabra activa en amarillo con pop, palabras clave en su color, el resto en blanco.
 
-    `base_scale` (%) encoge todo el bloque cuando una sola palabra es más ancha que el máximo.
+    `base_scale` (%) encoge todo el bloque cuando una sola palabra es más ancha que el máximo. `pop_in=True` (solo el primer
+    evento de cada bloque, y solo si el formato define subtitle_pop_in_ms) hace que el bloque aparezca creciendo de
+    POP_IN_START_PERCENT % a su escala en subtitle_pop_in_ms (\\t por palabra, porque cada palabra fija su propia escala).
     """
     active_scale = round(SUBTITLE_ACTIVE_SCALE * base_scale / 100)
+    pop_ms = video_format.subtitle_pop_in_ms if pop_in else 0
+
+    def pop(target: int) -> str:
+        """Etiquetas de escala de una palabra: fija, o animada desde POP_IN_START_PERCENT % hasta `target`."""
+        if pop_ms <= 0:
+            return f"\\fscx{target}\\fscy{target}"
+        start = round(base_scale * POP_IN_START_PERCENT / 100)
+        return f"\\fscx{start}\\fscy{start}\\t(0,{pop_ms},\\fscx{target}\\fscy{target})"
+
     parts = []
     for i, word in enumerate(display_words):
         if i == active_idx:
             parts.append(
-                f"{{\\c{SUBTITLE_ACTIVE_COLOR}\\fscx{active_scale}\\fscy{active_scale}}}{word}"
+                f"{{\\c{SUBTITLE_ACTIVE_COLOR}{pop(active_scale)}}}{word}"
                 f"{{\\c{SUBTITLE_NORMAL_COLOR}\\fscx{base_scale}\\fscy{base_scale}}}"
             )
         elif keyword_flags[i]:
-            parts.append(f"{{\\c{SUBTITLE_KEYWORD_COLOR}}}{word}{{\\c{SUBTITLE_NORMAL_COLOR}}}")
+            parts.append(f"{{\\c{SUBTITLE_KEYWORD_COLOR}{pop(base_scale) if pop_ms > 0 else ''}}}{word}{{\\c{SUBTITLE_NORMAL_COLOR}}}")
+        elif pop_ms > 0:
+            parts.append(f"{{{pop(base_scale)}}}{word}")
         else:
             parts.append(word)
     scale_tag = f"\\fscx{base_scale}\\fscy{base_scale}" if base_scale != 100 else ""
-    pos_y = round(video_format.height * video_format.subtitle_pos_y_frac)
-    pos = f"{{\\an5\\pos({video_format.width // 2},{pos_y}){scale_tag}}}"
+    pos_y = video_format.height - video_format.subtitle_margin_v
+    pos = f"{{\\an2\\pos({video_format.width // 2},{pos_y}){scale_tag}}}"
     return pos + " ".join(parts)
 
 
@@ -267,8 +307,9 @@ def build_karaoke_events(timing_metadata: dict[str, Any], video_format: VideoFor
                     end = int((idx + 1) * step_ms)
                     raw_words.append({"word": token, "start_ms": start, "end_ms": end, "duration_ms": end - start})
 
-        # Bloques de 2-3 palabras, partidos si no caben en el ancho máximo
-        for chunk in fit_chunks_to_width(chunk_words(raw_words, max_chunk_size=3), display, video_format):
+        # Bloques de subtitle_chunk_words palabras del formato (2-3 vertical, 5-7 horizontal), partidos si no caben en el ancho máximo
+        min_words, max_words = video_format.subtitle_chunk_words
+        for chunk in fit_chunks_to_width(chunk_words(raw_words, max_words, min_words), display, video_format):
             if not chunk:
                 continue
             chunk_start_ms = cumulative_offset_ms + chunk[0]["start_ms"]
@@ -299,12 +340,13 @@ def build_karaoke_events(timing_metadata: dict[str, Any], video_format: VideoFor
 
     events: list[dict[str, Any]] = []
     for chunk_idx, ce in enumerate(chunk_events):
-        for start, end, active in karaoke_slices(ce["start_ms"], ce["end_ms"], ce["word_starts"]):
+        for slice_idx, (start, end, active) in enumerate(karaoke_slices(ce["start_ms"], ce["end_ms"], ce["word_starts"])):
             events.append({
                 "start_ms": start,
                 "end_ms": end,
                 "text": render_chunk_text(
-                    ce["display"], ce["keywords"], active, video_format, chunk_base_scale(ce["display"], video_format)
+                    ce["display"], ce["keywords"], active, video_format, chunk_base_scale(ce["display"], video_format),
+                    pop_in=slice_idx == 0,  # el pop-in solo al aparecer el bloque, no en cada cambio de palabra activa
                 ),
                 "scale": chunk_base_scale(ce["display"], video_format),
                 "chunk": chunk_idx,

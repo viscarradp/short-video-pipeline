@@ -7,37 +7,46 @@ imágenes, edita el estilo correspondiente en styles.py (scene_guidance) — no 
 # Instrucciones narrativas por perfil (español). Se insertan en {profile_instructions}.
 PROFILE_INSTRUCTIONS: dict[str, str] = {
     "curiosity": """
-FORMATO: video de datos curiosos (ciencia, mecánica, cuerpo humano, cómo funcionan las cosas).
+FORMATO: short vertical de 30 a 35 segundos de datos curiosos (ciencia, mecánica, cuerpo humano, cómo funcionan las
+cosas): unas 8 escenas de ~4 segundos (si más abajo se pide otro número EXACTO de escenas, ese manda), una idea
+por escena, a ritmo rápido.
 ESTRUCTURA OBLIGATORIA:
-- Escena 1 (gancho): una afirmación sorprendente o una pregunta con algo en juego para el espectador
-  (su dinero, su salud, su seguridad, algo que hace todos los días). Ejemplo de tono: "Tu auto pierde
-  potencia cada vez que haces esto sin saberlo."
-- Escenas intermedias: cada escena revela UN dato nuevo y concreto que avanza la explicación paso a paso,
-  como una cadena de causa y efecto. Nada de relleno ni de repetir lo ya dicho.
-- Cada 3 o 4 escenas, reabre la curiosidad con un micro-gancho ("pero eso no es lo peor", "y aquí viene
-  lo raro", "lo que casi nadie sabe es esto").
-- Penúltimas escenas: el dato más impactante (el payoff que prometió el gancho).
-- Última escena: un cierre memorable que conecte con la primera frase (para que el video invite a verse
-  otra vez) o una pregunta directa que invite a comentar.
+- Escena 1 (gancho): una pregunta o afirmación de CHOQUE directa, legible en menos de 3 segundos, sobre algo que
+  le importa al espectador (su dinero, su salud, su seguridad, algo que hace todos los días). Entra de golpe:
+  sin saludo, sin introducción y sin anunciar lo que vas a explicar. Ejemplo de tono: "Tu auto pierde potencia
+  cada vez que haces esto sin saberlo."
+- Escenas 2 a 6: cada escena revela UN dato nuevo y concreto que avanza la explicación paso a paso, como una cadena
+  de causa y efecto. Nada de relleno ni de repetir lo ya dicho. Hacia la mitad, reabre la curiosidad UNA vez con un
+  micro-gancho breve ("pero eso no es lo peor", "y aquí viene lo raro"); no uses uno más.
+- Escena 7 (u 8 si el guion tiene 9): el dato más impactante, el payoff que prometió el gancho.
+- Última escena: una frase conectora corta que haga LOOP natural con la escena 1 (que al terminar el video el
+  espectador sienta que la primera frase vuelve a empezar) o que invite a ver el video completo relacionado
+  ("En el video completo te cuento por qué"). Sin despedidas ni "gracias por ver".
 ESTILO DE NARRACIÓN:
-- Segunda persona ("tú"), español neutro latinoamericano, frases cortas de máximo 15 palabras.
+- Segunda persona ("tú"), español neutro latinoamericano, frases cortas: una sola frase por escena, de 9 a 11 palabras,
+  con palabras cortas y comunes (evita tecnicismos largos si hay una palabra simple).
 - Cifras y comparaciones concretas en vez de adjetivos vagos ("tres veces más caliente que un horno", no
   "muy caliente").
 - Precisión: no inventes datos. Si una cifra es aproximada, dilo ("casi", "más de", "alrededor de").
 - Sin consejos médicos o financieros categóricos; explica el fenómeno, no prescribas.
 """.strip(),
     "micronovela": """
-FORMATO: micronovela narrada en primera persona por la protagonista o el protagonista (formato storytime):
-secretos familiares, traiciones, herencias, infidelidades, suspenso.
+FORMATO: micronovela vertical de 30 a 35 segundos narrada en primera persona por la protagonista o el protagonista
+(formato storytime): secretos familiares, traiciones, herencias, infidelidades, suspenso. Unas 8 escenas de
+~4 segundos (si más abajo se pide otro número EXACTO de escenas, ese manda), una idea o un golpe de tensión por escena.
 ESTRUCTURA OBLIGATORIA:
-- Escena 1 (gancho): empieza en el momento de mayor tensión o con una confesión ("El día de mi boda,
-  mi suegra me dio un sobre que no debía abrir hasta que ella muriera."). Nada de presentaciones.
-- Escenas 2 a 4: el contexto mínimo indispensable, siempre con tensión creciente.
-- A mitad de la historia: un giro que cambie lo que el espectador creía.
-- Escenas finales: la revelación escala hasta el punto más alto.
-- Última escena: un cliffhanger que deje una pregunta abierta y obligue a buscar la parte 2.
+- Escena 1 (gancho): empieza en el momento de mayor tensión con una confesión o afirmación de CHOQUE directa,
+  legible en menos de 3 segundos ("Mi suegra me dio un sobre que no debía abrir."). Sin saludo, sin
+  presentaciones y sin contexto previo.
+- Escenas 2 y 3: el contexto mínimo indispensable, siempre con tensión creciente.
+- Escena 4 o 5: un giro que cambie lo que el espectador creía.
+- Escenas siguientes: la revelación escala hasta el punto más alto.
+- Última escena: un cliffhanger breve, de pocas palabras, que deje una pregunta abierta, haga loop con la
+  escena 1 y obligue a buscar la parte 2 (la frase de cierre del perfil va dentro de esa escena y cuenta en el
+  máximo de palabras).
 ESTILO DE NARRACIÓN:
-- Primera persona, emocional y coloquial, español neutro latinoamericano. Frases cortas, ritmo de confesión.
+- Primera persona, emocional y coloquial, español neutro latinoamericano. Una sola frase corta por escena, de 10 a
+  12 palabras, ritmo de confesión.
 - Detalles sensoriales y objetos concretos (una carta, un anillo, un mensaje en el celular) que hagan la
   historia visual.
 - Diálogo en estilo indirecto o citas muy breves dentro de la narración (la voz es una sola).
@@ -157,12 +166,12 @@ Este video lo protagoniza un personaje recurrente que YA EXISTE; su aspecto sale
 - Nombre: {protagonist_name}
 - Descripción (solo para que entiendas quién es; NO la copies en los prompts): {protagonist_description}
 REGLAS DEL PROTAGONISTA:
-A. Es la GUÍA del espectador: aparece en el 70 % o más de las escenas (lo ideal, 75 a 85 %) y casi siempre se ve en pantalla, no solo cuando la narración dice su nombre. También las escenas de datos, explicaciones o descripciones del mundo lo llevan, porque él las vive, las presencia, reacciona o las demuestra (por ejemplo: la narración explica cómo gira la Tierra -> el protagonista señala un globo terráqueo gigante abierto en corte; habla del cielo -> mira por un telescopio; cuenta que el mar se retiró -> está de pie en una playa donde el mar desapareció). Antes de dejarlo fuera, pregúntate: ¿puede estar en el cuadro mirando, señalando, tocando, midiendo o reaccionando a lo que dice la escena? Si sí, ponlo. Déjalo fuera SOLO en unas pocas escenas de plano épico o de escala (el planeta visto desde la órbita) para dar variedad visual: como mucho 3 de cada 10 escenas, y nunca más de dos seguidas. En cada escena donde se vea, 'characters_in_scene' incluye "{protagonist_id}" (exactamente ese ID).
+A. Es la GUÍA del espectador, pero solo se ve en las ESCENAS CLAVE: aproximadamente el 20 % de las escenas (nunca más de 24 en todo el video ni más del 25 %), repartidas a lo largo del video: el gancho, los giros, las decisiones importantes y el desenlace. En cada una de esas escenas 'characters_in_scene' incluye "{protagonist_id}" (exactamente ese ID) y el prompt lo llama "the main character". El 80 % restante son escenas de B-roll explicativo SIN personas: ilustran con objetos, lugares, mapas, esquemas, paisajes, fenómenos o detalles lo que dice la narración (el planeta visto desde la órbita, un globo terráqueo en corte, una calle vacía, un reloj, un mapa), con 'characters_in_scene' vacío. Evita dos escenas seguidas con el protagonista salvo en un clímax.
 B. NO lo definas en 'characters' (se añade solo). Ahí van únicamente los personajes secundarios, si los hay, con su descripción corta en inglés (máximo 30 palabras).
 C. En 'visual_prompt_en' llámalo "the main character" UNA sola vez por prompt: nunca por su nombre ({protagonist_name}), nunca los dos juntos ("the main character, {protagonist_name},") ni con una descripción de su cara, edad, piel, cabello o cuerpo. Describe lo que HACE (acción y postura), su expresión, la ropa o el equipo que lleva en esa escena si cambia y el escenario. Los personajes secundarios sí se nombran con un sustantivo de rol corto ("the neighbor").
 D. En 'narration_es' nómbralo por su nombre ({protagonist_name}); no lo llames "el protagonista".
 E. Varía el escenario, la acción y el tipo de plano de una escena a otra: dos escenas seguidas no repiten lugar ni encuadre.
-F. En cada escena SIN el protagonista, 'visual_prompt_en' dice explícitamente "no people, no characters" (si no se prohíbe, el generador de imágenes inventa personas distintas en cada escena y rompe la idea de un solo personaje) y no usa "the main character". Esa frase no se contradice dentro del mismo prompt: en una escena "no people" no hay tribus, multitudes, habitantes ni actividad humana. Si la narración habla de gente (la humanidad, todos, una tribu), prefiere poner al protagonista ante ella o viviéndola; solo si hace falta que se vean otras personas, descríbelas como una pequeña multitud de fondo con los rostros sin verse ("a small crowd in the background, faces not visible") o como un personaje secundario definido en 'characters' (nombrado con su sustantivo de rol y con su ID en 'characters_in_scene'); nunca como personas inventadas en primer plano.{framing_rule}"""
+F. En cada escena SIN el protagonista (el B-roll, la mayoría), 'visual_prompt_en' dice explícitamente "no people, no characters" (si no se prohíbe, el generador de imágenes inventa personas distintas en cada escena y rompe la idea de un solo personaje) y no usa "the main character". Esa frase no se contradice dentro del mismo prompt: en una escena "no people" no hay tribus, multitudes, habitantes ni actividad humana, ni manos ni siluetas. Si la narración habla de gente (la humanidad, todos, una tribu), ilustra con el lugar, los objetos o sus huellas (casas vacías, una fogata apagada); solo si hace falta que se vean otras personas, descríbelas como un personaje secundario definido en 'characters' (nombrado con su sustantivo de rol y con su ID en 'characters_in_scene'); nunca como personas inventadas en primer plano.{framing_rule}"""
 
 # Regla G del bloque anterior según el formato de video (clave = config.FORMATS id). Sin entrada para un formato, se omite.
 PROTAGONIST_FRAMING_RULES: dict[str, str] = {
@@ -189,12 +198,12 @@ JSON FORMAT TEMPLATE:
 {profile_instructions}
 
 === REGLAS DE NARRACIÓN (OBLIGATORIAS) ===
-1. Escenas: entre {scenes_min} y {scenes_max}.
+1. Escenas: {scenes_rule}.
 2. Presupuesto de palabras: cada 'narration_es' tiene entre {words_min} y {words_max} palabras (objetivo: {words_target}),
-   para que cada escena dure ~{scene_seconds} segundos con la voz del perfil. La escena 1 tiene como máximo {words_target} palabras.
+   para que cada escena dure ~{scene_seconds} segundos con la voz del perfil. La escena 1 tiene como máximo {words_target} palabras.{strict_rule}
 3. Gancho: la primera frase de la escena 1 abre un bucle de curiosidad o hace una afirmación impactante.
    PROHIBIDO: saludos, "en este video", "hoy te voy a contar", presentaciones o anunciar lo que viene.
-   La resolución llega más adelante, NUNCA en la escena 1.
+   La resolución llega más adelante, NUNCA en la escena 1.{hook_rule}
 4. Texto para voz sintética: CERO emojis, CERO paréntesis, CERO acotaciones o notas de audio. Sin abreviaturas
    (escribe "kilómetros por hora", no "km/h"). Los números pueden ir en cifras.
 5. 'highlight_words': de 1 a 3 palabras copiadas EXACTAMENTE de 'narration_es' de esa escena (las de más impacto o cifras).{cta_rule}
@@ -222,6 +231,18 @@ GUÍA DEL ESTILO VISUAL '{style_label}':
 Responde ÚNICAMENTE con el objeto JSON válido, sin texto antes ni después y sin bloques de código.
 """
 
+# Reglas extra de los perfiles de short vertical (strict_scenes): se verifican por código y el guion se rechaza si no se cumplen
+STRICT_RULE_TEMPLATE = """
+   REGLA DURA (se verifica por código; si no se cumple, el guion se rechaza): ninguna escena puede tener menos de {words_min} ni
+   más de {words_max} palabras (cuenta TODAS las palabras, también la última escena con su frase de cierre){total_rule}."""
+STRICT_TOTAL_RULE_TEMPLATE = (
+    " y el guion completo suma entre {total_min} y {total_max} palabras, para que el audio total dure entre "
+    "{sec_min:g} y {sec_max:g} segundos"
+)
+STRICT_HOOK_RULE = (
+    "\n   La escena 1 se lee en menos de 3 segundos: una pregunta o afirmación de choque directa, sin saludo ni contexto."
+)
+
 CTA_RULE_TEMPLATE = '\n   La narración de la ÚLTIMA escena termina exactamente con la frase: "{cta}".'
 
 
@@ -239,14 +260,14 @@ STORYBOARD_PROTAGONIST_BLOCK_TEMPLATE = """
 Este video lo protagoniza un personaje recurrente que YA EXISTE; su aspecto sale de una imagen de referencia, no de tu texto.
 - Nombre: {protagonist_name}
 - Descripción (solo para que entiendas quién es; NO la copies en los prompts): {protagonist_description}
-El formato es "un mismo personaje recorre distintos escenarios": {protagonist_name} es la GUÍA del espectador y se ve en pantalla casi todo el video, no solo en las escenas cuyo texto dice su nombre.
+El formato es "un mismo personaje recorre distintos escenarios": {protagonist_name} es la GUÍA del espectador y se ve en las escenas CLAVE, no en todas; el resto es B-roll explicativo.
 REGLAS DEL PROTAGONISTA:
-A. Aparece en el 70 % o más de las escenas que recibas en esta llamada (apunta a tres de cada cuatro: 19 de 25): es la regla por defecto, no la excepción. NO decidas por si la narración lo nombra: las escenas de datos, explicaciones o descripciones del mundo (física, tiempo, ciencia, lugares, historia) TAMBIÉN lo llevan, porque él las vive, las presencia, reacciona o las demuestra. La imagen ilustra la narración CON el protagonista dentro del cuadro (esto manda sobre la regla 2: nada de mostrar el dato solo). Ejemplos: la narración explica cómo gira la Tierra -> el protagonista señala un globo terráqueo gigante abierto en corte; habla de la fuerza centrífuga -> hace girar un cubo con agua; habla del cielo o del espacio -> mira por un telescopio; cuenta que el mar se retiró -> está de pie en una playa donde el mar desapareció; habla de un calor o un frío extremos -> lo sufre en ese paisaje. Antes de dejarlo fuera, pregúntate: ¿puede estar en el cuadro mirando, señalando, tocando, midiendo o reaccionando a lo que dice la escena? Si sí, ponlo. Déjalo fuera SOLO en unas pocas escenas de plano épico o de escala (el planeta visto desde la órbita, una ciudad entera desde el aire) para dar variedad visual: como mucho 3 de cada 10 escenas, y nunca más de dos seguidas. En cada escena donde se vea, 'characters_in_scene' incluye "{protagonist_id}" (exactamente ese ID).
+A. Aparece solo en aproximadamente el 20 % de las escenas que recibas en esta llamada (nunca más del 25 % ni más de 24 en total): las escenas clave (el arranque, los giros, las decisiones, el desenlace), repartidas a lo largo del tramo y rara vez dos seguidas. En cada una, la imagen lo muestra en el cuadro mirando, señalando, tocando o reaccionando a lo que dice la narración, 'characters_in_scene' incluye "{protagonist_id}" (exactamente ese ID) y el prompt lo llama "the main character". NO decidas por si la narración lo nombra: elige las escenas por su peso en la historia. El 80 % restante son escenas de B-roll explicativo SIN personas: ilustran con objetos, lugares, mapas, esquemas, paisajes, fenómenos o detalles lo que dice la narración (esto manda sobre la regla 2: nada de mostrar gente), con 'characters_in_scene' vacío.
 B. NO lo definas en 'characters' (se añade solo). Ahí van únicamente los personajes secundarios, si los hay, con su descripción corta en inglés (máximo 30 palabras).
 C. En 'visual_prompt_en' llámalo "the main character" UNA sola vez por prompt: nunca por su nombre ({protagonist_name}), nunca los dos juntos ("the main character, {protagonist_name},") ni con una descripción de su cara, edad, piel, cabello o cuerpo. Describe lo que HACE (acción y postura), su expresión, la ropa o el equipo que lleva en esa escena si cambia y el escenario. Los personajes secundarios sí se nombran con un sustantivo de rol corto ("the neighbor").
 D. La narración no se toca: tú solo describes imágenes.
 E. Varía el escenario, la acción y el tipo de plano de una escena a otra: dos escenas seguidas no repiten lugar ni encuadre salvo que la narración lo exija.
-F. En cada escena SIN el protagonista, 'visual_prompt_en' dice explícitamente "no people, no characters" (si no se prohíbe, el generador de imágenes inventa personas distintas en cada escena y rompe la idea de un solo personaje) y no usa "the main character". Esa frase no se contradice dentro del mismo prompt: en una escena "no people" no hay tribus, multitudes, habitantes ni actividad humana. Si la narración habla de gente (la humanidad, todos, una tribu), prefiere poner al protagonista ante ella o viviéndola; solo si hace falta que se vean otras personas, descríbelas como una pequeña multitud de fondo con los rostros sin verse ("a small crowd in the background, faces not visible") o como un personaje secundario definido en 'characters' (nombrado con su sustantivo de rol y con su ID en 'characters_in_scene'); nunca como personas inventadas en primer plano.{framing_rule}"""
+F. En cada escena SIN el protagonista (el B-roll, la mayoría), 'visual_prompt_en' dice explícitamente "no people, no characters" (si no se prohíbe, el generador de imágenes inventa personas distintas en cada escena y rompe la idea de un solo personaje) y no usa "the main character". Esa frase no se contradice dentro del mismo prompt: en una escena "no people" no hay tribus, multitudes, habitantes ni actividad humana, ni manos ni siluetas. Si la narración habla de gente (la humanidad, todos, una tribu), ilustra con el lugar, los objetos o sus huellas (casas vacías, una fogata apagada); solo si hace falta que se vean otras personas, descríbelas como un personaje secundario definido en 'characters' (nombrado con su sustantivo de rol y con su ID en 'characters_in_scene'); nunca como personas inventadas en primer plano.{framing_rule}"""
 
 # Regla de personajes del storyboard según haya protagonista fijo o no ({{}} = llaves literales del ejemplo JSON).
 STORYBOARD_CHARACTERS_RULE_PROTAGONIST = (
@@ -344,13 +365,10 @@ ESCENAS DE ESTE TRAMO (scene_id: narración definitiva):
 {protagonist_quota}
 Devuelve el JSON con las {n_scenes} escenas de este tramo (scene_id {first_id} a {last_id}) y nada más."""
 
-# Recordatorio con números al final del mensaje de usuario (el modelo barato cumple mejor una cuota concreta que un "70 %").
-# {max_without} = escenas que pueden quedar sin el protagonista (solo planos épicos o de escala; llevan "no people, no characters").
+# Recordatorio con números al final del mensaje de usuario (el modelo barato cumple mejor una cuota concreta que un "20 %").
+# {target_with} = escenas clave con el protagonista (~20 %); {max_with} = tope (25 %, máximo 24 en todo el video).
 STORYBOARD_PROTAGONIST_QUOTA_TEMPLATE = """
-CUOTA DEL PROTAGONISTA: {protagonist_name} ("{protagonist_id}") se ve en al menos {min_with} de estas {n_scenes} escenas; como máximo {max_without} pueden quedar sin él, y únicamente si son planos épicos o de escala (esas dicen "no people, no characters"). En las demás, el protagonista está en el cuadro con 'characters_in_scene' = ["{protagonist_id}"].
-"""
-STORYBOARD_PROTAGONIST_QUOTA_ALL_TEMPLATE = """
-CUOTA DEL PROTAGONISTA: {protagonist_name} ("{protagonist_id}") se ve en TODAS estas escenas, con 'characters_in_scene' = ["{protagonist_id}"].
+CUOTA DEL PROTAGONISTA: {protagonist_name} ("{protagonist_id}") se ve solo en las escenas clave: unas {target_with} de estas {n_scenes} escenas y NUNCA más de {max_with}, con 'characters_in_scene' = ["{protagonist_id}"] y "the main character" en el prompt. Las demás son B-roll explicativo sin personas ("no people, no characters", 'characters_in_scene' vacío).
 """
 
 STORYBOARD_PREVIOUS_BLOCK_TEMPLATE = """

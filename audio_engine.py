@@ -69,6 +69,10 @@ def parse_loudnorm_json(stderr: str) -> Optional[dict[str, float]]:
     return None
 
 
+SFX_SINGLE_GRAPH_MAX = 40  # hasta tantos whooshes, un único amix (el grafo de siempre: no invalida mezclas en caché)
+SFX_BATCH_SIZE = 20  # con más cortes (videos de 100+ escenas), whooshes por grupo que luego se suman en un segundo amix
+
+
 def transition_offsets_samples(scenes: list[dict[str, Any]]) -> list[int]:
     """Muestra de inicio de cada escena desde la 2.ª (donde suena el whoosh); sale de los fotogramas, sin deriva."""
     return [start * SAMPLES_PER_FRAME for start in scene_start_frames(scenes)[1:]]
@@ -95,10 +99,27 @@ def build_mix_filtergraph(
     tail = f"apad=whole_len={total_samples},atrim=end_sample={total_samples}"
     if with_sfx and offsets_samples:
         n = len(offsets_samples)
-        parts.append(f"[2:a]{_FMT},volume={SFX_VOLUME},asplit={n}" + "".join(f"[w{i}]" for i in range(n)))
-        for i, off in enumerate(offsets_samples):
-            parts.append(f"[w{i}]adelay={off}S|{off}S[dw{i}]")  # 'S' = muestras: sin redondeo a ms
-        parts.append("".join(f"[dw{i}]" for i in range(n)) + f"amix=inputs={n}:dropout_transition=0:normalize=0[sfx]")
+        if n <= SFX_SINGLE_GRAPH_MAX:
+            parts.append(f"[2:a]{_FMT},volume={SFX_VOLUME},asplit={n}" + "".join(f"[w{i}]" for i in range(n)))
+            for i, off in enumerate(offsets_samples):
+                parts.append(f"[w{i}]adelay={off}S|{off}S[dw{i}]")  # 'S' = muestras: sin redondeo a ms
+            parts.append("".join(f"[dw{i}]" for i in range(n)) + f"amix=inputs={n}:dropout_transition=0:normalize=0[sfx]")
+        else:
+            # Videos largos (100+ cortes): en vez de un único amix de n entradas, grupos de SFX_BATCH_SIZE whooshes que se
+            # suman en un segundo amix (normalize=0 = suma, así que el resultado es el mismo)
+            groups = [offsets_samples[g : g + SFX_BATCH_SIZE] for g in range(0, n, SFX_BATCH_SIZE)]
+            parts.append(f"[2:a]{_FMT},volume={SFX_VOLUME},asplit={len(groups)}" + "".join(f"[wg{g}]" for g in range(len(groups))))
+            index = 0
+            for g, group in enumerate(groups):
+                parts.append(f"[wg{g}]asplit={len(group)}" + "".join(f"[w{index + k}]" for k in range(len(group))))
+                for k, off in enumerate(group):
+                    parts.append(f"[w{index + k}]adelay={off}S|{off}S[dw{index + k}]")
+                parts.append(
+                    "".join(f"[dw{index + k}]" for k in range(len(group)))
+                    + f"amix=inputs={len(group)}:dropout_transition=0:normalize=0[sg{g}]"
+                )
+                index += len(group)
+            parts.append("".join(f"[sg{g}]" for g in range(len(groups))) + f"amix=inputs={len(groups)}:dropout_transition=0:normalize=0[sfx]")
         parts.append(f"[vmain][bgmd][sfx]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,{tail}[aout]")
     else:
         parts.append(f"[vmain][bgmd]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,{tail}[aout]")

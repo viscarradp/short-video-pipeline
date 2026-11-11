@@ -5,7 +5,8 @@ Comandos:
                     en vez de escribir el guion con el LLM, importa tu propio texto como narración.
   retry-scene       Regenera escenas concretas (imagen y/o narración) y reensambla el video.
   styles            Lista los estilos visuales disponibles (opción --style de generate).
-  create-character  Crea un personaje persistente (imagen de referencia) para los videos con protagonista.
+  create-character  Crea un personaje persistente (imagen de referencia) para los videos con protagonista;
+                    con --pack genera además su pack de 5 poses (para --use-local-pack).
   characters        Lista los personajes de la biblioteca (opción --character de generate).
 """
 
@@ -33,19 +34,40 @@ except ImportError:
 from character_engine import (
     DEFAULT_CANDIDATES,
     MAX_CANDIDATES,
+    PACK_POSES,
     Character,
     available_slugs,
+    check_pack_creation,
     choose_candidate,
     create_character,
     create_hint,
+    create_pack,
     list_characters,
     load_character,
+    load_pack,
+    pack_estimate_usd,
+    require_pack,
     validate_slug,
 )
-from config import BASE_DIR, CHARACTERS_DIR, FAL_KEY, FORMATS, IMAGE_COST_USD, SEEDREAM_COST_USD, WORKSPACE_DIR, get_format
+from config import (
+    BASE_DIR,
+    CHARACTERS_DIR,
+    FAL_KEY,
+    FORMATS,
+    HYBRID_DEV_SCENES,
+    IMAGE_COST_USD,
+    IMAGE_TIER_CHARACTER_HYBRID,
+    IMAGE_TIER_HYBRID,
+    IMAGE_TIER_LEGACY,
+    IMAGE_TIERS,
+    SEEDREAM_COST_USD,
+    WORKSPACE_DIR,
+    get_format,
+    image_unit_cost_usd,
+)
 from env_checker import check_and_prepare_environment
 from pipeline_utils import CacheManifest, PipelineError, RunStats
-from profiles import VideoProfile, get_profile, PROFILES
+from profiles import MAX_FORCED_SCENES, MIN_FORCED_SCENES, VideoProfile, get_profile, PROFILES
 from script_engine import (
     VideoProjectSchema,
     generate_or_load_script,
@@ -126,9 +148,14 @@ class RunConfig:
     video_format: str = "vertical"  # formato de video resuelto (config.FORMATS); los run_config.json antiguos son verticales
     character: str = ""  # slug del personaje protagonista (characters/<slug>/); "" = sin protagonista
     minutes: Optional[float] = None  # duración objetivo del video (--minutes); None = la del perfil
+    scenes: Optional[int] = None  # nº EXACTO de escenas forzado (--scenes); None = el rango del perfil / de --minutes
     # Guion importado (--script-file): hash del texto limpio, escena-segundos y nombre del archivo; None = guion escrito por el LLM.
     # Si está, retry-scene sabe que no debe añadir la frase de cierre del perfil ni pedir el .txt original.
     script_import: Optional[dict[str, Any]] = None
+    # Tier de imágenes (config.IMAGE_TIERS) y pack local. "" = run_config.json antiguo sin tier: se trata como 'legacy'
+    # (comportamiento anterior) para no invalidar imágenes ya pagadas; ver resolve_image_tier.
+    image_tier: str = ""
+    use_local_pack: bool = False
 
     def save(self, workspace: Path) -> None:
         data = asdict(self)
@@ -153,7 +180,10 @@ class RunConfig:
                 video_format=str(data.get("video_format") or "vertical"),
                 character=str(data.get("character") or ""),
                 minutes=_as_minutes(data.get("minutes")),
+                scenes=_as_scenes(data.get("scenes")),
                 script_import=_as_import_info(data.get("script_import")),
+                image_tier=str(data.get("image_tier") or "") if data.get("image_tier") in IMAGE_TIERS else "",
+                use_local_pack=bool(data.get("use_local_pack", False)),
             )
         except (OSError, ValueError, KeyError, TypeError) as e:
             raise PipelineError(f"{RUN_CONFIG_FILENAME} es inválido o está incompleto ({e}). Ejecuta 'generate' de nuevo para recrearlo.") from e
@@ -166,6 +196,15 @@ def _as_minutes(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return minutes if minutes > 0 else None
+
+
+def _as_scenes(value: Any) -> Optional[int]:
+    """Nº de escenas forzado guardado en run_config.json: entero >= 1, o None si falta o no es válido."""
+    try:
+        scenes = int(value)
+    except (TypeError, ValueError):
+        return None
+    return scenes if scenes >= 1 else None
 
 
 def _as_import_info(value: Any) -> Optional[dict[str, Any]]:
@@ -185,6 +224,26 @@ def _read_run_config_raw(workspace: Path) -> dict[str, Any]:
 def _read_run_config_format(workspace: Path) -> Optional[str]:
     """video_format del run_config.json existente; None si no hay (o no se puede leer) o es de una versión sin el campo."""
     return str(_read_run_config_raw(workspace).get("video_format") or "") or None
+
+
+def resolve_image_tier(explicit: Optional[str], saved: Optional[str], project_exists: bool, has_protagonist: bool) -> str:
+    """Tier de imágenes: --image-tier explícito > el guardado en run_config.json > 'legacy' si el proyecto ya existe sin tier
+    (conserva su comportamiento anterior: la caché por huella no se invalida y las imágenes ya pagadas se reutilizan) >
+    default de un proyecto nuevo (character-hybrid con protagonista, hybrid sin él)."""
+    if explicit:
+        return explicit
+    if saved in IMAGE_TIERS:
+        return str(saved)
+    if project_exists:
+        return IMAGE_TIER_LEGACY
+    return IMAGE_TIER_CHARACTER_HYBRID if has_protagonist else IMAGE_TIER_HYBRID
+
+
+def check_image_tier_option(value: Optional[str]) -> Optional[str]:
+    """Valida --image-tier; PipelineError con los valores admitidos si no existe."""
+    if value is not None and value not in IMAGE_TIERS:
+        raise PipelineError(f"--image-tier '{value}' no existe. Valores: {', '.join(IMAGE_TIERS)} (legacy = comportamiento anterior).")
+    return value
 
 
 def resolve_character(slug: str, profile: VideoProfile, mock_images: bool) -> Optional[Character]:
@@ -317,6 +376,7 @@ def run_pipeline(
             format_id=config.video_format,
             protagonist=protagonist,
             target_minutes=config.minutes,
+            target_scenes=config.scenes,
         )
     if protagonist is not None and project.protagonist_slug != protagonist.slug:
         console.print(
@@ -362,6 +422,8 @@ def run_pipeline(
         force=force.images,
         overrides=image_overrides,
         stats=stats,
+        tier=config.image_tier or IMAGE_TIER_LEGACY,
+        use_local_pack=config.use_local_pack,
     )
 
     # Módulo 4: Subtitle Engine
@@ -439,21 +501,31 @@ def _fmt_ids(ids: list[int]) -> str:
 
 
 def _estimate_gate(
-    profile: VideoProfile, workspace: Path, scene_seconds: float, mock_images: bool, assume_yes: bool, force_images: bool = False
+    profile: VideoProfile,
+    workspace: Path,
+    scene_seconds: float,
+    mock_images: bool,
+    assume_yes: bool,
+    force_images: bool = False,
+    image_tier: str = IMAGE_TIER_LEGACY,
+    use_local_pack: bool = False,
 ) -> Callable[[VideoProjectSchema, Optional[Character], CacheManifest, RunStats], None]:
     """Hook de run_pipeline para guiones importados: muestra la estimación (palabras, duración, escenas, imágenes por pagar y
     costo) y pregunta antes de pagar imágenes (por defecto No). Con --yes, o si no hay nada que pagar (modo mock o todo en
     caché), no pregunta. Si se rechaza: sale sin voz ni imágenes; el storyboard queda guardado y repetir el comando sigue desde ahí."""
 
     def gate(project: VideoProjectSchema, protagonist: Optional[Character], manifest: CacheManifest, stats: RunStats) -> None:
-        estimate = estimate_import(project, profile, workspace, manifest, protagonist, scene_seconds, stats, force_images)
+        pack = require_pack(protagonist, mock_images) if use_local_pack and protagonist is not None else None
+        estimate = estimate_import(
+            project, profile, workspace, manifest, protagonist, scene_seconds, stats, force_images, image_tier, pack
+        )
         console.print(render_estimate(estimate, mock_images))
         if mock_images or estimate.images_to_pay == 0:
             return
         if assume_yes:
             console.print("[dim]--yes: se generan las imágenes sin preguntar.[/dim]")
             return
-        if not typer.confirm(f"¿Generar {estimate.images_to_pay} imagen(es) por ~${estimate.images_cost_usd:.2f}?", default=False):
+        if not typer.confirm(f"¿Generar {estimate.images_to_pay} imagen(es) (tier {image_tier}) por ~${estimate.images_cost_usd:.2f}?", default=False):
             console.print(
                 "[yellow]Cancelado: no se generó ninguna imagen. El storyboard quedó guardado: vuelve a ejecutar el mismo "
                 "comando para continuar (con --yes para no preguntar, o con --mock-images para probar gratis).[/yellow]"
@@ -569,6 +641,12 @@ def generate(
         help="Duración objetivo del video en minutos (ajusta el número de escenas del guion). Por defecto, la del perfil. "
         "No se usa con --script-file (la duración la da tu texto).",
     ),
+    scenes: Optional[int] = typer.Option(
+        None,
+        "--scenes",
+        help="Fuerza EXACTAMENTE N escenas en el guion (pruebas baratas, p. ej. --scenes 2); sustituye el rango de escenas del "
+        "perfil y de --minutes, y la validación del guion lo respeta. No se usa con --script-file (las escenas salen del texto).",
+    ),
     script_file: Optional[Path] = typer.Option(
         None,
         "--script-file",
@@ -587,6 +665,22 @@ def generate(
         "--yes",
         "-y",
         help="Solo con --script-file: no pedir confirmación tras la estimación de costo (genera las imágenes directamente).",
+    ),
+    image_tier: Optional[str] = typer.Option(
+        None,
+        "--image-tier",
+        help=(
+            "Modelos de imagen: fast (Flux schnell en todo, $0.003/img), hybrid (escenas 1-2 con Flux dev, el resto schnell; "
+            "default de proyectos sin protagonista), character-hybrid (protagonista con Seedream v4.5 edit + referencia, "
+            "B-roll con schnell; default con protagonista) o legacy (comportamiento anterior). Por defecto: el guardado en "
+            "run_config.json; los proyectos existentes sin tier siguen en legacy para no volver a pagar sus imágenes."
+        ),
+    ),
+    use_local_pack: Optional[bool] = typer.Option(
+        None,
+        "--use-local-pack/--no-use-local-pack",
+        help="Solo con character-hybrid: las escenas con protagonista reutilizan una pose del pack local del personaje "
+        "(create-character <slug> --pack) en vez de llamar a Seedream: $0. Por defecto, lo guardado en run_config.json.",
     ),
 ):
     """Genera un video completo (vertical 9:16 u horizontal 16:9) con edición dinámica, SFX, BGM y subtítulos animados."""
@@ -666,6 +760,10 @@ def generate(
     if minutes is not None and minutes <= 0:
         console.print("[bold red]Error:[/] --minutes debe ser mayor que 0.")
         raise typer.Exit(code=1)
+    target_scenes = scenes  # a diferencia de --minutes, no se hereda del run_config.json: es una opción de prueba
+    if scenes is not None and not (MIN_FORCED_SCENES <= scenes <= MAX_FORCED_SCENES):
+        console.print(f"[bold red]Error:[/] --scenes debe estar entre {MIN_FORCED_SCENES} y {MAX_FORCED_SCENES}.")
+        raise typer.Exit(code=1)
     try:
         chosen_character = resolve_character(character_slug, prof_obj, mock_images)
     except PipelineError as e:
@@ -674,12 +772,40 @@ def generate(
     if chosen_character is not None:
         console.print(f"[cyan]Personaje protagonista:[/] {chosen_character.name} ({chosen_character.slug})")
 
+    # Tier de imágenes y pack local (se validan antes de tocar nada)
+    try:
+        check_image_tier_option(image_tier)
+        project_exists = bool(previous_config) or (WORKSPACE_DIR / target_slug / "script.json").is_file()
+        chosen_tier = resolve_image_tier(image_tier, str(previous_config.get("image_tier") or ""), project_exists, chosen_character is not None)
+        if image_tier == IMAGE_TIER_CHARACTER_HYBRID and chosen_character is None:
+            raise PipelineError("--image-tier character-hybrid requiere un protagonista (--character SLUG).")
+        local_pack = use_local_pack if use_local_pack is not None else bool(previous_config.get("use_local_pack", False))
+        if local_pack and chosen_tier != IMAGE_TIER_CHARACTER_HYBRID:
+            if use_local_pack:
+                raise PipelineError(f"--use-local-pack solo se usa con el tier character-hybrid (tier actual: {chosen_tier}).")
+            local_pack = False  # guardado de una corrida anterior con otro tier
+        if local_pack:
+            if chosen_character is None:
+                raise PipelineError("--use-local-pack requiere un protagonista (--character SLUG).")
+            require_pack(chosen_character, mock_images)  # falla pronto si el personaje no tiene pack (o es mock con imágenes reales)
+    except PipelineError as e:
+        _print_pipeline_error(e)
+        raise typer.Exit(code=1)
+    console.print(
+        f"[cyan]Tier de imágenes:[/] {chosen_tier}" + (" + pack local" if local_pack else "")
+        + (" [dim](proyecto existente sin tier guardado: comportamiento anterior; usa --image-tier para cambiarlo)[/dim]"
+           if chosen_tier == IMAGE_TIER_LEGACY and not image_tier and not previous_config.get("image_tier") else "")
+    )
+
     # Guion importado: limpieza y división en escenas por código (la duración sale del texto, no de --minutes)
     import_source: Optional[ImportedScript] = None
     if script_file is not None:
         if minutes is not None:
             console.print("[yellow]Aviso: --minutes se ignora con --script-file (la duración la da tu texto).[/yellow]")
+        if scenes is not None:
+            console.print("[yellow]Aviso: --scenes se ignora con --script-file (las escenas salen de tu texto).[/yellow]")
         target_minutes = None
+        target_scenes = None
         try:
             import_source = prepare_import(
                 raw_script_text,
@@ -697,6 +823,8 @@ def generate(
         )
     if target_minutes is not None:
         console.print(f"[cyan]Duración objetivo:[/] {target_minutes:g} min")
+    if target_scenes is not None:
+        console.print(f"[cyan]Escenas forzadas:[/] exactamente {target_scenes}")
 
     # 3. Environment & Assets Check (Fase 0)
     env_status = _check_environment()
@@ -719,7 +847,10 @@ def generate(
             video_format=format_id,
             character=character_slug,
             minutes=target_minutes,
+            scenes=target_scenes,
             script_import=import_source.run_config_info() if import_source is not None else None,
+            image_tier=chosen_tier,
+            use_local_pack=local_pack,
         )
 
         # 5. Las 5 etapas (con guion importado, la estimación de costo y la confirmación van tras el storyboard)
@@ -731,7 +862,10 @@ def generate(
             persist_config=True,
             import_source=import_source,
             after_script=(
-                _estimate_gate(prof_obj, project_workspace, import_source.scene_seconds, mock_images, yes, force_flags.images)
+                _estimate_gate(
+                    prof_obj, project_workspace, import_source.scene_seconds, mock_images, yes, force_flags.images,
+                    chosen_tier, local_pack,
+                )
                 if import_source is not None
                 else None
             ),
@@ -759,6 +893,7 @@ def generate(
     if result.project.protagonist_slug:
         table.add_row("Protagonista", result.project.protagonist_slug)
     table.add_row("Regenerado", _stats_line(result.stats))
+    table.add_row("Tier de imágenes", chosen_tier + (" + pack local" if local_pack else ""))
     table.add_row("Costo Fal.ai", _cost_summary(result.stats))
     table.add_row("Archivo MP4 Final", str(result.final_video_path))
     table.add_row("Metadatos Publicación", str(project_workspace / "post_metadata.txt"))
@@ -770,13 +905,15 @@ def generate(
 
 
 def _cost_summary(stats: RunStats) -> str:
-    """Costo REAL de la ejecución: imágenes pagadas por endpoint (cantidad x precio de config.IMAGE_COST_USD), guion (LLM)
-    y total. Lo servido de caché y los modos mock no cuestan nada."""
-    lines = [
-        f"{count} imagen(es) {endpoint.removeprefix('fal-ai/')} × ${IMAGE_COST_USD.get(endpoint, 0.0):g} = "
-        f"${count * IMAGE_COST_USD.get(endpoint, 0.0):.3f}"
-        for endpoint, count in stats.paid_images.items()
-    ]
+    """Costo REAL de la ejecución, desglosado por modelo: imágenes pagadas por endpoint (cantidad x precio de cada imagen;
+    Flux dev depende del tamaño), imágenes reutilizadas del pack local ($0), guion (LLM) y total. Lo servido de caché y los
+    modos mock no cuestan nada."""
+    lines = []
+    for endpoint, count in stats.paid_images.items():
+        usd = stats.paid_usd.get(endpoint, count * IMAGE_COST_USD.get(endpoint, 0.0))
+        lines.append(f"{count} imagen(es) {endpoint.removeprefix('fal-ai/')} × ${usd / count:g} = ${usd:.3f}")
+    if stats.pack_images:
+        lines.append(f"{stats.pack_images} imagen(es) reutilizadas del pack local × $0 = $0.000")
     if stats.llm_cost_usd:
         lines.append(f"guion (LLM): ${stats.llm_cost_usd:.4f}")
     if not lines:
@@ -821,6 +958,12 @@ def retry_scene(
         "--seed",
         help="Semilla para la nueva imagen (por defecto, una aleatoria nueva).",
     ),
+    image_tier: Optional[str] = typer.Option(
+        None,
+        "--image-tier",
+        help="Tier de imágenes de la nueva imagen (fast, hybrid, character-hybrid, legacy). Por defecto, el de run_config.json "
+        "(sin tier guardado: legacy). Si lo indicas se guarda en run_config.json.",
+    ),
 ):
     """Regenera una o más escenas (imagen nueva y/o narración corregida) y reensambla el video final."""
     start_time = time.time()
@@ -845,6 +988,17 @@ def retry_scene(
                 "Ejecuta 'generate' de nuevo con las mismas opciones para crearlo."
             )
         config = RunConfig.load(workspace)
+        check_image_tier_option(image_tier)
+        if image_tier and image_tier != config.image_tier:
+            config.image_tier = image_tier
+            if config.use_local_pack and image_tier != IMAGE_TIER_CHARACTER_HYBRID:
+                config.use_local_pack = False
+            config.save(workspace)
+            console.print(f"[yellow]Tier de imágenes cambiado a '{image_tier}' y guardado en {RUN_CONFIG_FILENAME}.[/yellow]")
+        elif not config.image_tier:
+            config.image_tier = IMAGE_TIER_LEGACY  # proyecto sin tier guardado: comportamiento anterior
+        if config.image_tier == IMAGE_TIER_CHARACTER_HYBRID and not config.character:
+            console.print("[yellow]Aviso: character-hybrid sin protagonista equivale a fast (todo Flux schnell).[/yellow]")
         resolve_character(config.character, get_profile(config.profile), config.mock_images)  # falla pronto si falta el personaje
 
         if not scene:
@@ -901,6 +1055,7 @@ def retry_scene(
         if config.script_import is not None:
             console.print("[dim]Proyecto de guion importado: se usa script.json (no hace falta el .txt original ni se llama al LLM).[/dim]")
         console.print(
+            f"[cyan]Tier de imágenes:[/] {config.image_tier}" + (" + pack local" if config.use_local_pack else "") + " | "
             f"[cyan]Escenas a rehacer:[/] {_fmt_ids(scene_ids)} | "
             f"[cyan]re-roll de imagen:[/] {_fmt_ids(reroll_ids)}"
             + (f" | [cyan]seed:[/] {seed}" if seed is not None and reroll_ids else "")
@@ -996,11 +1151,42 @@ def create_character_cmd(
         "--choose",
         help="Candidata (1, 2...) que será ref.png. Con un personaje ya creado solo cambia la referencia, sin generar nada.",
     ),
-    mock: bool = typer.Option(False, "--mock", help="Dibujar retratos de prueba con Pillow ($0.00); solo sirven con --mock-images."),
+    mock: bool = typer.Option(False, "--mock", help="Dibujar retratos (o, con --pack, poses) de prueba con Pillow ($0.00); solo sirven con --mock-images."),
+    pack: bool = typer.Option(
+        False,
+        "--pack",
+        help=f"Sobre un personaje YA creado: genera su pack de {len(PACK_POSES)} poses base (neutral, sonriendo señalando, sorprendido, "
+        f"pensativo, caminando de perfil) con Seedream v4.5 edit + ref.png en characters/<slug>/pack/ "
+        f"(~${pack_estimate_usd():.2f}; pide confirmación). Se usa con generate --image-tier character-hybrid --use-local-pack.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Solo con --pack: no pedir confirmación del costo."),
 ):
     """Crea un personaje persistente (o cambia su referencia con --choose): el protagonista conserva la misma cara en todos los videos."""
     try:
         validate_slug(slug)
+        if pack:
+            if slug not in available_slugs():
+                load_character(slug)  # error estándar con los personajes disponibles
+            ignored = [flag for flag, value in (("--name", name), ("--description", description), ("--style", style), ("--from-image", from_image), ("--choose", choose)) if value]
+            if ignored:
+                console.print(f"[yellow]Aviso: {', '.join(ignored)} se ignora(n): con --pack solo se genera el pack del personaje existente.[/yellow]")
+            check_pack_creation(slug, mock)
+            if not mock:
+                console.print(f"[cyan]Pack de '{slug}':[/] {len(PACK_POSES)} poses con Seedream v4.5 edit + referencia, estimación ~${pack_estimate_usd():.2f}")
+                if not yes and not typer.confirm(f"¿Generar {len(PACK_POSES)} imágenes por ~${pack_estimate_usd():.2f}?", default=False):
+                    console.print("[yellow]Cancelado: no se generó ninguna imagen (usa --yes para no preguntar o --mock para probar gratis).[/yellow]")
+                    raise typer.Exit(code=1)
+            created = create_pack(slug, mock=mock)
+            table = Table(title="Pack de personaje creado", border_style="green")
+            table.add_column("Propiedad", style="cyan")
+            table.add_column("Detalle", style="white")
+            table.add_row("Personaje", slug)
+            table.add_row("Poses", "\n".join(f"{p['label']} -> {_display_path(created.pose_path(p))}" for p in created.poses))
+            table.add_row("Índice", _display_path(created.dir / "pack.json"))
+            table.add_row("Costo Fal.ai", "$0.000 (pack mock con Pillow)" if mock else f"{len(created.poses)} imagen(es) × ${SEEDREAM_COST_USD:g} = ${len(created.poses) * SEEDREAM_COST_USD:.3f}")
+            console.print(table)
+            console.print(f"[bold green]✓ Listo. Úsalo con:[/bold green] python main.py generate ... --character {slug} --image-tier character-hybrid --use-local-pack")
+            return
         if slug in available_slugs():
             if choose is None:
                 raise PipelineError(
@@ -1067,9 +1253,17 @@ def list_characters_cmd():
     table.add_column("Nombre", style="white")
     table.add_column("Descripción", style="white")
     table.add_column("Referencia", style="green", overflow="fold")
+    table.add_column("Pack", style="white")
     for char in chars:
+        try:
+            char_pack = load_pack(char)
+        except PipelineError:
+            char_pack = None
+            pack_text = "dañado"
+        else:
+            pack_text = "sin pack" if char_pack is None else f"{len(char_pack.poses)} poses" + (" (mock)" if char_pack.mock else "")
         desc = char.description_en if len(char.description_en) <= 70 else char.description_en[:67].rstrip() + "..."
-        table.add_row(char.slug, escape(char.name), escape(desc), _display_path(char.ref_image) + (" (mock)" if char.mock else ""))
+        table.add_row(char.slug, escape(char.name), escape(desc), _display_path(char.ref_image) + (" (mock)" if char.mock else ""), pack_text)
     console.print(table)
 
 

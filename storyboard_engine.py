@@ -30,13 +30,16 @@ from rich.panel import Panel
 from rich.table import Table
 
 import fal_client
-from character_engine import Character
+from character_engine import Character, CharacterPack
 from config import (
     CAMERA_EFFECTS,
     DEFAULT_CAMERA_EFFECT,
     FAL_KEY,
+    FLUX_DEV_ENDPOINT,
     FLUX_ENDPOINT,
     IMAGE_COST_USD,
+    IMAGE_TIER_LEGACY,
+    LOCAL_PACK_ENDPOINT,
     PROTAGONIST_ID,
     SEEDREAM_EDIT_ENDPOINT,
     SEEDREAM_T2I_ENDPOINT,
@@ -52,7 +55,6 @@ from prompt_templates import (
     STORYBOARD_CHARACTERS_RULE_PROTAGONIST,
     STORYBOARD_PREVIOUS_BLOCK_TEMPLATE,
     STORYBOARD_PROTAGONIST_BLOCK_TEMPLATE,
-    STORYBOARD_PROTAGONIST_QUOTA_ALL_TEMPLATE,
     STORYBOARD_PROTAGONIST_QUOTA_TEMPLATE,
     STORYBOARD_SYSTEM_PROMPT_TEMPLATE,
     STORYBOARD_TASKS,
@@ -78,7 +80,10 @@ from script_engine import (
     light_normalize_project,
     llm_response_cost,
     load_cached_project,
+    max_protagonist_scenes,
     sync_protagonist,
+    target_protagonist_scenes,
+    trim_protagonist_scenes,
 )
 from styles import VisualStyle, get_style
 
@@ -91,8 +96,7 @@ STORYBOARD_TEMPERATURE = 0.4  # más bajo que el del guionista (0.7): la narraci
 STORYBOARD_BLOCK_SCENES = 40  # escenas por llamada al LLM; con más, se pide primero lo global y luego los bloques
 STORYBOARD_MAX_ATTEMPTS = 3
 STORYBOARD_CONTEXT_SCENES = 3  # últimas escenas del bloque anterior que se pasan al siguiente (continuidad)
-PROTAGONIST_TARGET_PERCENT = 75  # % de escenas con el protagonista que se PIDE en el mensaje (el modelo se queda corto 1 o 2 escenas)
-PROTAGONIST_MIN_PERCENT = 70  # % mínimo que se ACEPTA: por debajo, se repite la llamada contándole el problema; tras el último intento se usa el mejor y se avisa
+# Cuota del protagonista (escenas clave ~20 %, tope 25 % y 24 en total): ver script_engine.target_protagonist_scenes / max_protagonist_scenes
 SOURCE_SCRIPT_FILENAME = "source_script.txt"  # copia del texto limpio dentro del workspace
 
 # Escenas por tamaño: una escena tiene entre 55 % y 145 % de las palabras objetivo (15 -> 8 a 22)
@@ -674,43 +678,38 @@ def _scene_lines(scene_ids: list[int], narrations: dict[int, str]) -> str:
 
 def protagonist_quota_text(protagonist: Optional[Character], n_scenes: int) -> str:
     """Recordatorio con números para el mensaje de usuario ('' sin protagonista): en cuántas de las `n_scenes` escenas de la
-    llamada se le pide que salga el protagonista (PROTAGONIST_TARGET_PERCENT %, redondeado hacia arriba) y cuántas pueden quedar sin él."""
+    llamada se le pide que salga el protagonista (escenas clave, ~20 %) y el tope (25 %)."""
     if protagonist is None or n_scenes < 1:
         return ""
-    min_with = _min_scenes_with(n_scenes, PROTAGONIST_TARGET_PERCENT)
-    max_without = n_scenes - min_with
-    template = STORYBOARD_PROTAGONIST_QUOTA_TEMPLATE if max_without > 0 else STORYBOARD_PROTAGONIST_QUOTA_ALL_TEMPLATE
-    return template.format(
+    return STORYBOARD_PROTAGONIST_QUOTA_TEMPLATE.format(
         protagonist_name=protagonist.name,
         protagonist_id=PROTAGONIST_ID,
-        min_with=min_with,
+        target_with=target_protagonist_scenes(n_scenes),
         n_scenes=n_scenes,
-        max_without=max_without,
+        max_with=max_protagonist_scenes(n_scenes),
     )
 
 
-def _min_scenes_with(n_scenes: int, percent: int) -> int:
-    """Escenas que son al menos `percent` % de `n_scenes` (techo con enteros: 0.7 * 10 en coma flotante da 7.000000000000001)."""
-    return -(-n_scenes * percent // 100)
-
-
 def _protagonist_share_check(visuals: dict[int, "_SceneVisual"], protagonist: Optional[Character]) -> tuple[int, str]:
-    """(escenas con el protagonista, problema) de un tramo recién parseado. problema = "" si llega al mínimo aceptado
-    (PROTAGONIST_MIN_PERCENT %) o si no hay protagonista; si no, el texto que se le devuelve al LLM al repetir la llamada."""
+    """(escenas con el protagonista, problema) de un tramo recién parseado. problema = "" si sale en al menos una escena y no
+    pasa del tope (25 %) o si no hay protagonista; si no, el texto que se le devuelve al LLM al repetir la llamada."""
     n_with = sum(1 for v in visuals.values() if PROTAGONIST_ID in v.characters_in_scene)
     if protagonist is None or not visuals:
         return n_with, ""
     n = len(visuals)
-    needed = _min_scenes_with(n, PROTAGONIST_MIN_PERCENT)
-    if n_with >= needed:
-        return n_with, ""
-    without = [i for i in sorted(visuals) if PROTAGONIST_ID not in visuals[i].characters_in_scene]
-    return n_with, (
-        f"El protagonista ('{PROTAGONIST_ID}') solo sale en {n_with} de {n} escenas y debe salir en al menos {needed}: es la guía del "
-        f"espectador y aparece también en las escenas de datos o explicaciones (las vive, las presencia, las demuestra). Solo los planos "
-        f"épicos o de escala pueden quedar sin él. Ponlo (en 'characters_in_scene' y como \"the main character\" en 'visual_prompt_en') "
-        f"en más de las escenas donde ahora no sale: {', '.join(str(i) for i in without[:12])}."
-    )
+    target, cap = target_protagonist_scenes(n), max_protagonist_scenes(n)
+    if n_with == 0:
+        return n_with, (
+            f"El protagonista ('{PROTAGONIST_ID}') no sale en ninguna escena; debe salir en las escenas clave (unas {target} de {n}). "
+            f"Ponlo (en 'characters_in_scene' y como \"the main character\" en 'visual_prompt_en') en esas escenas; el resto es B-roll sin personas."
+        )
+    if n_with > cap:
+        return n_with, (
+            f"El protagonista ('{PROTAGONIST_ID}') sale en {n_with} de {n} escenas y debe salir como máximo en {cap} (lo ideal, unas "
+            f"{target}): solo las escenas clave. Quítalo (de 'characters_in_scene' y de 'visual_prompt_en') de las demás y haz de ellas "
+            "B-roll explicativo sin personas (\"no people, no characters\")."
+        )
+    return n_with, ""
 
 
 def _llm_max_tokens(n_scenes: int) -> int:
@@ -1083,8 +1082,8 @@ def normalize_imported_project(
     """Normaliza (en el lugar) el storyboard de un guion importado.
 
     Fija estilo y formato resueltos, sincroniza el protagonista (characters[PROTAGONIST_ID], protagonist_slug) y aplica la
-    normalización ligera (hashtags, textos de publicación, scene_id 1..N) SIN la frase de cierre del perfil. No exige
-    cuota de escenas con el protagonista (solo avisa si son pocas), no valida presupuestos de palabras ni el nº de
+    normalización ligera (hashtags, textos de publicación, scene_id 1..N) SIN la frase de cierre del perfil. Recorta las
+    escenas con el protagonista que pasen del tope (25 %, máx. 24; solo toca ID y prompt visual), no valida presupuestos de palabras ni el nº de
     escenas, y NO toca la narración (se verifica)."""
     style = get_style(style_id or profile.default_style_id)
     project.visual_style_id = style.id
@@ -1095,15 +1094,8 @@ def normalize_imported_project(
         sync_protagonist(project, protagonist)
         canonicalize_protagonist_ids(project, protagonist)
         _scrub_protagonist_name(project, protagonist)
+        trim_protagonist_scenes(project, max_protagonist_scenes(len(project.scenes)))  # tope global (25 %, máx. 24), sin tocar la narración
         ensure_no_people_without_protagonist(project)
-        n_with = sum(1 for sc in project.scenes if PROTAGONIST_ID in sc.characters_in_scene)
-        if project.scenes and n_with * 100 < len(project.scenes) * PROTAGONIST_MIN_PERCENT:
-            console.print(
-                f"[yellow]Nota: el protagonista '{escape(protagonist.name)}' sale en {n_with} de {len(project.scenes)} escenas "
-                f"(menos del {PROTAGONIST_MIN_PERCENT} % que pide el formato). Si quieres que salga más, añade "
-                f"\"{PROTAGONIST_ID}\" a 'characters_in_scene' de esas escenas en script.json (y su prompt visual debe llamarlo "
-                "\"the main character\").[/yellow]"
-            )
     else:
         project.protagonist_slug = ""
 
@@ -1205,6 +1197,9 @@ class ImportEstimate:
     images_cached: int  # ya pagadas y vigentes en el workspace (no se vuelven a pagar)
     paid_by_endpoint: dict[str, int]  # endpoint -> imágenes por pagar
     llm_cost_usd: float = 0.0  # storyboard de esta ejecución (ya gastado)
+    cost_by_endpoint: dict[str, float] = field(default_factory=dict)  # endpoint -> USD (Flux dev depende del tamaño)
+    pack_images: int = 0  # escenas que reutilizarán una pose del pack local ($0, no se paga ni se llama a la API)
+    image_tier: str = IMAGE_TIER_LEGACY
 
     @property
     def images_to_pay(self) -> int:
@@ -1212,7 +1207,7 @@ class ImportEstimate:
 
     @property
     def images_cost_usd(self) -> float:
-        return sum(n * IMAGE_COST_USD.get(endpoint, 0.0) for endpoint, n in self.paid_by_endpoint.items())
+        return sum(self.cost_by_endpoint.get(endpoint, n * IMAGE_COST_USD.get(endpoint, 0.0)) for endpoint, n in self.paid_by_endpoint.items())
 
 
 def estimate_import(
@@ -1224,6 +1219,8 @@ def estimate_import(
     scene_seconds: float,
     stats: Optional[RunStats] = None,
     force_images: bool = False,
+    image_tier: str = IMAGE_TIER_LEGACY,
+    pack: Optional[CharacterPack] = None,
 ) -> ImportEstimate:
     """Cuántas imágenes habría que pagar (solo lectura): las que no tienen en el workspace una imagen real vigente con la
     huella actual (misma regla que generate_all_images, sin las migraciones de workspaces antiguos). Con `force_images`
@@ -1232,8 +1229,10 @@ def estimate_import(
     ref_sha256 = file_sha256(protagonist.ref_image) if protagonist is not None else None
     cached = 0
     paid: dict[str, int] = {}
+    costs: dict[str, float] = {}
+    pack_images = 0
     for scene in project.scenes:
-        plan = plan_scene_image(scene, project, video_format, protagonist, ref_sha256)
+        plan = plan_scene_image(scene, project, video_format, protagonist, ref_sha256, image_tier, pack)
         image_path = output_dir / "images" / f"scene_{scene.scene_id:02d}.png"
         is_cached = not force_images and (
             image_path.exists()
@@ -1242,8 +1241,11 @@ def estimate_import(
         )
         if is_cached:
             cached += 1
+        elif plan.is_local_pack:
+            pack_images += 1
         else:
             paid[plan.endpoint] = paid.get(plan.endpoint, 0) + 1
+            costs[plan.endpoint] = costs.get(plan.endpoint, 0.0) + plan.cost_usd
     words = sum(_count_words(t) for sc in project.scenes for t in sc.narration_es.split())
     wps = effective_words_per_sec(profile)
     return ImportEstimate(
@@ -1256,11 +1258,16 @@ def estimate_import(
         images_cached=cached,
         paid_by_endpoint=paid,
         llm_cost_usd=stats.llm_cost_usd if stats is not None else 0.0,
+        cost_by_endpoint=costs,
+        pack_images=pack_images,
+        image_tier=image_tier,
     )
 
 
 _ENDPOINT_LABELS = {
     FLUX_ENDPOINT: "Flux schnell",
+    FLUX_DEV_ENDPOINT: "Flux dev",
+    LOCAL_PACK_ENDPOINT: "pack local",
     SEEDREAM_EDIT_ENDPOINT: "Seedream v4.5 con referencia",
     SEEDREAM_T2I_ENDPOINT: "Seedream v4.5 texto a imagen",
 }
@@ -1283,15 +1290,19 @@ def render_estimate(est: ImportEstimate, mock_images: bool) -> Panel:
         table.add_row("Imágenes", f"{est.images_total} (modo --mock-images: tarjetas locales, sin costo)")
         table.add_row("Total a pagar", "$0.00")
     else:
+        table.add_row("Tier de imágenes", est.image_tier)
         table.add_row("Imágenes por pagar", f"{est.images_to_pay} de {est.images_total}" + (f" ({est.images_cached} ya en caché)" if est.images_cached else ""))
         if est.paid_by_endpoint:
-            prices = {IMAGE_COST_USD.get(endpoint, 0.0) for endpoint in est.paid_by_endpoint}
-            labels = [_ENDPOINT_LABELS.get(endpoint, endpoint) for endpoint in est.paid_by_endpoint]
-            if len(prices) == 1:  # p. ej. Seedream edit y texto a imagen cuestan lo mismo
-                detail = f"${prices.pop():g} ({' + '.join(labels)})"
-            else:
-                detail = ", ".join(f"${IMAGE_COST_USD.get(ep, 0.0):g} ({_ENDPOINT_LABELS.get(ep, ep)})" for ep in est.paid_by_endpoint)
-            table.add_row("Costo por imagen", detail)
+            table.add_row(
+                "Desglose por modelo",
+                "\n".join(
+                    f"{n} × {_ENDPOINT_LABELS.get(ep, ep)} × ${est.cost_by_endpoint.get(ep, n * IMAGE_COST_USD.get(ep, 0.0)) / n:g} = "
+                    f"${est.cost_by_endpoint.get(ep, n * IMAGE_COST_USD.get(ep, 0.0)):.3f}"
+                    for ep, n in est.paid_by_endpoint.items()
+                ),
+            )
+        if est.pack_images:
+            table.add_row("Pack local", f"{est.pack_images} escena(s) con pose del pack del personaje × $0 = $0.000")
         table.add_row("Total a pagar", f"[bold]${est.images_cost_usd:.2f}[/bold]")
     if est.llm_cost_usd:
         table.add_row("Storyboard (LLM)", f"${est.llm_cost_usd:.4f} (ya gastado en esta ejecución)")

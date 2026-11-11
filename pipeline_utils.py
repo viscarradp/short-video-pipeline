@@ -151,15 +151,20 @@ class RunStats:
     final: bool = False
     # Costo real de la ejecución (USD): imágenes pagadas por endpoint (endpoint -> cantidad) y guion (usage.cost del LLM)
     paid_images: dict[str, int] = field(default_factory=dict)
+    paid_usd: dict[str, float] = field(default_factory=dict)  # endpoint -> USD exactos (cada imagen con su precio)
+    pack_images: int = 0  # escenas resueltas con una imagen del pack local del personaje ($0, sin llamar a la API)
     llm_cost_usd: float = 0.0
 
-    def count_paid_image(self, endpoint: str) -> None:
-        """Registra una imagen real (pagada) generada con `endpoint`; el modo mock no se registra."""
+    def count_paid_image(self, endpoint: str, unit_cost_usd: Optional[float] = None) -> None:
+        """Registra una imagen real (pagada) generada con `endpoint`; el modo mock no se registra. `unit_cost_usd` = precio
+        de esa imagen (Flux dev depende del tamaño); por defecto, config.IMAGE_COST_USD[endpoint]."""
+        cost = IMAGE_COST_USD.get(endpoint, 0.0) if unit_cost_usd is None else unit_cost_usd
         self.paid_images[endpoint] = self.paid_images.get(endpoint, 0) + 1
+        self.paid_usd[endpoint] = self.paid_usd.get(endpoint, 0.0) + cost
 
     def image_cost_usd(self) -> float:
-        """Costo de las imágenes pagadas: cantidad por endpoint x config.IMAGE_COST_USD."""
-        return sum(count * IMAGE_COST_USD.get(endpoint, 0.0) for endpoint, count in self.paid_images.items())
+        """Costo de las imágenes pagadas: suma exacta del precio de cada imagen."""
+        return sum(self.paid_usd.values())
 
     def total_cost_usd(self) -> float:
         """Costo real de la ejecución: imágenes pagadas + guion (LLM)."""

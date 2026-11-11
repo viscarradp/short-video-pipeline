@@ -57,7 +57,9 @@ class VideoFormat:
     subtitle_shadow: int
     subtitle_margin_lr: int  # márgenes laterales del .ass; también del estilo del gancho
     subtitle_max_line_width_px: int  # ninguna línea de un bloque debe superarlo (los bloques anchos se parten)
-    subtitle_pos_y_frac: float  # centro vertical de los subtítulos (fracción de la altura)
+    subtitle_margin_v: int  # MarginV: distancia (px a PlayResY) del borde inferior del bloque al borde inferior del cuadro (alineación 2)
+    subtitle_chunk_words: tuple[int, int]  # (mín, máx) palabras por bloque de subtítulos
+    subtitle_pop_in_ms: int  # animación de aparición de cada bloque (escala 80 % -> 100 %); 0 = sin animación
     hook_font_size: int
     hook_pos_y_frac: float  # borde superior del texto gancho (fracción de la altura)
     hook_box_padding: int
@@ -82,13 +84,15 @@ FORMATS: dict[str, VideoFormat] = {
         subtitle_shadow=4,
         subtitle_margin_lr=90,  # (1080 - 2*90) = 900 px disponibles; libass ajusta el texto dentro de esos márgenes
         subtitle_max_line_width_px=900,
-        subtitle_pos_y_frac=0.64,  # zona segura: 60-68 % de la altura; evita el 20 % inferior
+        subtitle_margin_v=620,  # centro-bajo: el bloque queda a ~64 % de la altura (zona segura; evita el 20 % inferior)
+        subtitle_chunk_words=(2, 3),
+        subtitle_pop_in_ms=80,  # pop-in corto al aparecer cada bloque
         hook_font_size=110,
         hook_pos_y_frac=0.15,  # evita el 12 % superior de la UI de la plataforma
         hook_box_padding=16,
         reach_hashtags=("#shorts", "#fyp", "#parati"),
     ),
-    # 16:9 (YouTube). A PlayResY=1080 los Fontsize son más chicos que a 1920; subtítulos en el quinto inferior.
+    # 16:9 (YouTube). A PlayResY=1080 los Fontsize son más chicos que a 1920; subtítulos en el tercio inferior clásico (MarginV 90).
     "horizontal": VideoFormat(
         id="horizontal",
         width=1920,
@@ -100,12 +104,14 @@ FORMATS: dict[str, VideoFormat] = {
             "leave empty headroom in the top fifth and keep the lower fifth simple. No text, no letters, no captions, no logos, no watermark."
         ),
         platform_label_es="videos horizontales en español para YouTube (formato 16:9, pantalla ancha)",
-        subtitle_font_size=90,
-        subtitle_outline=6,
-        subtitle_shadow=3,
+        subtitle_font_size=56,  # subtítulo clásico de YouTube: caben bloques de 5 a 7 palabras en una línea de <= 1480 px
+        subtitle_outline=4,
+        subtitle_shadow=2,
         subtitle_margin_lr=200,  # (1920 - 2*200) = 1520 px disponibles
         subtitle_max_line_width_px=1480,
-        subtitle_pos_y_frac=0.83,  # quinto inferior, por encima de los controles del reproductor
+        subtitle_margin_v=90,  # tercio inferior clásico de YouTube: ~90 px del borde inferior
+        subtitle_chunk_words=(5, 7),
+        subtitle_pop_in_ms=0,  # subtítulos clásicos: el bloque aparece sin animación
         hook_font_size=84,
         hook_pos_y_frac=0.08,
         hook_box_padding=12,
@@ -138,7 +144,7 @@ VIDEO_PIX_FMT = "yuv420p"
 # Guion: presupuesto de palabras por escena
 # Palabras por segundo de una voz neutra a velocidad normal (+0%); se escala por el voice_rate del perfil.
 WORDS_PER_SEC_BASE = 2.7
-SCENE_WORDS_TOLERANCE = 3  # el LLM puede desviarse +-3 palabras del presupuesto de cada escena
+SCENE_WORDS_TOLERANCE = 3  # el LLM puede desviarse +-3 palabras del presupuesto de cada escena (se usa en el prompt; los shorts verticales fijan sus límites en profiles.SHORT_SCENE_WORDS y se validan por código)
 
 # Efectos de cámara permitidos (Ken Burns). ÚNICA fuente de verdad: los usan el prompt del guionista
 # (script_engine.build_system_prompt) y el despachador de zoompan (video_engine.build_zoompan_filter).
@@ -177,7 +183,7 @@ SUBTITLE_OUTLINE = _VERTICAL.subtitle_outline
 SUBTITLE_SHADOW = _VERTICAL.subtitle_shadow
 SUBTITLE_MARGIN_LR = _VERTICAL.subtitle_margin_lr
 SUBTITLE_MAX_LINE_WIDTH_PX = _VERTICAL.subtitle_max_line_width_px
-SUBTITLE_POS_Y_FRAC = _VERTICAL.subtitle_pos_y_frac
+SUBTITLE_MARGIN_V = _VERTICAL.subtitle_margin_v
 HOOK_FONT_SIZE = _VERTICAL.hook_font_size
 HOOK_POS_Y_FRAC = _VERTICAL.hook_pos_y_frac
 HOOK_BOX_PADDING = _VERTICAL.hook_box_padding
@@ -195,12 +201,52 @@ FLUX_ENDPOINT = "fal-ai/flux/schnell"
 SEEDREAM_EDIT_ENDPOINT = "fal-ai/bytedance/seedream/v4.5/edit"
 SEEDREAM_T2I_ENDPOINT = "fal-ai/bytedance/seedream/v4.5/text-to-image"
 SEEDREAM_COST_USD = 0.04
-# ÚNICA fuente de verdad para los resúmenes de costo: RunStats.paid_images (endpoint -> imágenes pagadas) x este precio.
+# Flux dev (gancho del tier 'hybrid'): parámetros verificados en la API de Fal (image_size, num_inference_steps=28 por
+# defecto, guidance_scale=3.5 por defecto, enable_safety_checker=true por defecto). Fal lo factura por megapíxel de salida
+# ($0.025/MP) REDONDEANDO HACIA ARRIBA al megapíxel entero (1 MP = 1.000.000 px, estimación conservadora): 1280x720
+# (0.92 MP) = $0.025; 768x1360 (1.04 MP, vertical) = 2 MP = $0.05. No se pudo confirmar la regla exacta en la página de
+# precios de Fal; si Fal midiera 1 MP = 1.048.576 px, el vertical costaría $0.025 y esta estimación quedaría por encima.
+FLUX_DEV_ENDPOINT = "fal-ai/flux/dev"
+FLUX_DEV_STEPS = 28
+FLUX_DEV_GUIDANCE_SCALE = 3.5
+FLUX_DEV_COST_PER_MP_USD = 0.025
+HYBRID_DEV_SCENES = frozenset({1, 2})  # tier 'hybrid': estas escenas (el gancho) usan Flux dev; el resto, schnell
+
+# Imágenes reutilizadas del pack local del personaje (tier character-hybrid + --use-local-pack): no llaman a la API, $0.
+LOCAL_PACK_ENDPOINT = "local/character-pack"
+
+# Tiers de imagen (--image-tier). 'legacy' = comportamiento anterior (schnell en todo / Seedream en todo con protagonista):
+# es el que usan los proyectos existentes sin tier guardado en run_config.json, para no invalidar imágenes ya pagadas.
+IMAGE_TIER_FAST = "fast"
+IMAGE_TIER_HYBRID = "hybrid"
+IMAGE_TIER_CHARACTER_HYBRID = "character-hybrid"
+IMAGE_TIER_LEGACY = "legacy"
+IMAGE_TIERS = (IMAGE_TIER_FAST, IMAGE_TIER_HYBRID, IMAGE_TIER_CHARACTER_HYBRID, IMAGE_TIER_LEGACY)
+
+# Precio por imagen de los endpoints de precio fijo. Flux dev depende del tamaño: ver image_unit_cost_usd. Los resúmenes de
+# costo usan RunStats.paid_usd (suma exacta por endpoint, con el precio de cada imagen).
 IMAGE_COST_USD: dict[str, float] = {
     FLUX_ENDPOINT: FLUX_COST_USD,
+    FLUX_DEV_ENDPOINT: FLUX_DEV_COST_PER_MP_USD,  # por megapíxel; con tamaño usa flux_dev_cost_usd
     SEEDREAM_EDIT_ENDPOINT: SEEDREAM_COST_USD,
     SEEDREAM_T2I_ENDPOINT: SEEDREAM_COST_USD,
+    LOCAL_PACK_ENDPOINT: 0.0,
 }
+
+
+def flux_dev_cost_usd(image_size: dict) -> float:
+    """Costo de una imagen Flux dev: $0.025 x megapíxeles del tamaño pedido, redondeados hacia arriba (mínimo 1 MP).
+
+    Fal cuenta 1 MP = 1024x1024 px: 768x1360 (1 044 480 px) y 1280x720 quedan en 1 MP = $0.025."""
+    megapixels = max(1, -(-int(image_size["width"]) * int(image_size["height"]) // (1024 * 1024)))
+    return megapixels * FLUX_DEV_COST_PER_MP_USD
+
+
+def image_unit_cost_usd(endpoint: str, image_size: dict | None = None) -> float:
+    """Precio de UNA imagen del endpoint (Flux dev según el tamaño pedido; el resto, precio fijo)."""
+    if endpoint == FLUX_DEV_ENDPOINT and image_size is not None:
+        return flux_dev_cost_usd(image_size)
+    return IMAGE_COST_USD.get(endpoint, 0.0)
 
 # Audio: línea de tiempo exacta por muestras (1 fotograma = SAMPLES_PER_FRAME muestras, sin deriva)
 AUDIO_SAMPLE_RATE = 48000

@@ -1,4 +1,6 @@
-"""Image generation engine supporting Fal.ai Flux/schnell, Seedream v4.5 (protagonist projects) and Mock mode (Módulo 3)."""
+"""Image generation engine: Fal.ai Flux schnell / Flux dev / Seedream v4.5, pack local del personaje y modo Mock (Módulo 3).
+
+Los tiers de imagen (config.IMAGE_TIERS) deciden qué modelo usa cada escena: ver plan_scene_image."""
 
 import asyncio
 import math
@@ -13,18 +15,28 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from rich.console import Console
 
 import fal_client
-from character_engine import Character, load_character
+from character_engine import Character, CharacterPack, load_character, pick_pack_pose, require_pack
 from config import (
     FAL_KEY,
+    FLUX_DEV_ENDPOINT,
+    FLUX_DEV_GUIDANCE_SCALE,
+    FLUX_DEV_STEPS,
     FLUX_ENDPOINT,
     FLUX_IMAGE_SIZE_LEGACY,
     FONTS_DIR,
+    HYBRID_DEV_SCENES,
+    IMAGE_TIER_CHARACTER_HYBRID,
+    IMAGE_TIER_FAST,
+    IMAGE_TIER_HYBRID,
+    IMAGE_TIER_LEGACY,
+    LOCAL_PACK_ENDPOINT,
     PROTAGONIST_ID,
     SEEDREAM_EDIT_ENDPOINT,
     SEEDREAM_T2I_ENDPOINT,
     SUBTITLE_FONT_FILENAME,
     VideoFormat,
     get_format,
+    image_unit_cost_usd,
     seedream_size_valid,
 )
 from pipeline_utils import CacheManifest, PipelineError, RunStats, file_sha256, fingerprint
@@ -35,6 +47,7 @@ console = Console()
 
 # Parámetros de generación (forman parte de la huella de cada imagen)
 FLUX_MODEL = FLUX_ENDPOINT
+FLUX_DEV_MODEL = FLUX_DEV_ENDPOINT
 FLUX_STEPS = 4
 MIN_IMAGE_BYTES = 5000
 
@@ -52,6 +65,7 @@ class ImageOverrides:
 
 
 MOCK_FLUX_LABEL = "FLUX VISUAL PROMPT (EN):"
+MOCK_FLUX_DEV_LABEL = "FLUX DEV VISUAL PROMPT (EN):"
 
 
 def create_mock_scene_image(
@@ -363,6 +377,21 @@ async def _generate_fal_image(
     raise PipelineError(f"{output_path.name}: {last_error}")
 
 
+def build_flux_arguments(model: str, prompt: str, image_size: dict, seed: int) -> dict:
+    """Argumentos de una llamada a Flux. schnell: 4 pasos (sin guidance_scale). dev: 28 pasos y guidance_scale 3.5 (los
+    parámetros image_size / num_inference_steps / guidance_scale / enable_safety_checker son los de la API de fal-ai/flux/dev)."""
+    arguments: dict[str, Any] = {
+        "prompt": prompt,
+        "image_size": image_size,
+        "num_inference_steps": FLUX_DEV_STEPS if model == FLUX_DEV_MODEL else FLUX_STEPS,
+        "enable_safety_checker": True,
+        "seed": seed,
+    }
+    if model == FLUX_DEV_MODEL:
+        arguments["guidance_scale"] = FLUX_DEV_GUIDANCE_SCALE
+    return arguments
+
+
 async def generate_single_flux_image(
     prompt: str,
     output_path: Path,
@@ -370,21 +399,16 @@ async def generate_single_flux_image(
     video_format: VideoFormat,
     max_attempts: int = 3,
     seed: Optional[int] = None,
+    model: str = FLUX_MODEL,
 ) -> Path:
-    """Call fal-ai/flux/schnell (with retries, NSFW check) and download image to disk.
+    """Call fal-ai/flux/schnell (or fal-ai/flux/dev with model=FLUX_DEV_MODEL) with retries, NSFW check, and download the image.
 
     If `seed` is given it is used on every attempt (except after an NSFW rejection, which needs a new seed);
     otherwise each attempt uses a fresh random seed.
     """
     return await _generate_fal_image(
-        FLUX_MODEL,
-        lambda attempt_seed: {
-            "prompt": prompt,
-            "image_size": video_format.flux_image_size,
-            "num_inference_steps": FLUX_STEPS,
-            "enable_safety_checker": True,
-            "seed": attempt_seed,
-        },
+        model,
+        lambda attempt_seed: build_flux_arguments(model, prompt, video_format.flux_image_size, attempt_seed),
         output_path,
         semaphore,
         (video_format.width, video_format.height),
@@ -451,6 +475,19 @@ def image_fingerprint(prompt: str, mock_images: bool, image_size: Any) -> str:
     )
 
 
+def flux_dev_image_fingerprint(prompt: str, mock_images: bool, image_size: Any) -> str:
+    """Huella de una imagen Flux dev: prompt + modo mock + modelo + tamaño + pasos + guidance_scale."""
+    return fingerprint(
+        kind="image",
+        prompt=prompt,
+        mock_images=mock_images,
+        model=FLUX_DEV_MODEL,
+        image_size=image_size,
+        steps=FLUX_DEV_STEPS,
+        guidance_scale=FLUX_DEV_GUIDANCE_SCALE,
+    )
+
+
 def legacy_image_fingerprint(prompt: str) -> str:
     """Huella que tenían las imágenes reales (pagadas) con el tamaño anterior 'portrait_16_9' (576x1024)."""
     return image_fingerprint(prompt, False, FLUX_IMAGE_SIZE_LEGACY)
@@ -489,38 +526,59 @@ def seedream_image_fingerprint(
 class ImagePlan:
     """Cómo se genera la imagen de una escena: modelo, prompt final enviado, tamaño pedido y referencia (solo edición)."""
 
-    endpoint: str  # FLUX_MODEL | SEEDREAM_EDIT_ENDPOINT | SEEDREAM_T2I_ENDPOINT
+    endpoint: str  # FLUX_MODEL | FLUX_DEV_MODEL | SEEDREAM_EDIT_ENDPOINT | SEEDREAM_T2I_ENDPOINT | LOCAL_PACK_ENDPOINT
     prompt: str
     image_size: dict
-    ref_image: Optional[Path] = None  # ref.png del protagonista (solo SEEDREAM_EDIT_ENDPOINT)
+    ref_image: Optional[Path] = None  # ref.png (SEEDREAM_EDIT_ENDPOINT) o imagen de la pose del pack (LOCAL_PACK_ENDPOINT)
     ref_sha256: Optional[str] = None
     ref_slug: str = ""
+    pose: str = ""  # solo LOCAL_PACK_ENDPOINT: nombre de la pose elegida
 
     @property
     def is_flux(self) -> bool:
-        return self.endpoint == FLUX_MODEL
+        return self.endpoint in (FLUX_MODEL, FLUX_DEV_MODEL)
+
+    @property
+    def is_local_pack(self) -> bool:
+        return self.endpoint == LOCAL_PACK_ENDPOINT
+
+    @property
+    def cost_usd(self) -> float:
+        """Precio de esta imagen si hay que pagarla (Flux dev según su tamaño; pack local $0)."""
+        return image_unit_cost_usd(self.endpoint, self.image_size)
 
     @property
     def short_name(self) -> str:
         """Nombre corto del modelo para los mensajes de consola."""
         return {
             FLUX_MODEL: "Flux/schnell",
+            FLUX_DEV_MODEL: "Flux/dev",
             SEEDREAM_EDIT_ENDPOINT: "Seedream v4.5 edit + referencia",
             SEEDREAM_T2I_ENDPOINT: "Seedream v4.5 t2i",
+            LOCAL_PACK_ENDPOINT: "pack local del personaje",
         }[self.endpoint]
 
     @property
     def mock_label(self) -> str:
         """Rótulo del modelo en la tarjeta mock."""
-        if self.is_flux:
+        if self.endpoint == FLUX_MODEL:
             return MOCK_FLUX_LABEL
+        if self.endpoint == FLUX_DEV_MODEL:
+            return MOCK_FLUX_DEV_LABEL
         if self.endpoint == SEEDREAM_EDIT_ENDPOINT:
             return "SEEDREAM EDIT + REF:"
         return "SEEDREAM T2I - PROMPT (EN):"
 
     def fingerprint(self, mock_images: bool) -> str:
-        if self.is_flux:
+        if self.endpoint == FLUX_MODEL:
             return image_fingerprint(self.prompt, mock_images, self.image_size)
+        if self.endpoint == FLUX_DEV_MODEL:
+            return flux_dev_image_fingerprint(self.prompt, mock_images, self.image_size)
+        if self.is_local_pack:
+            # Sin mock_images: la imagen es local y cuesta $0 en ambos modos (su hash ya distingue un pack mock de uno real)
+            return fingerprint(
+                kind="image", model=LOCAL_PACK_ENDPOINT, pose=self.pose, pose_sha256=self.ref_sha256, image_size=self.image_size
+            )
         return seedream_image_fingerprint(self.prompt, self.endpoint, self.image_size, self.ref_sha256, mock_images)
 
 
@@ -530,18 +588,50 @@ def plan_scene_image(
     video_format: VideoFormat,
     character: Optional[Character] = None,
     ref_sha256: Optional[str] = None,
+    tier: str = IMAGE_TIER_LEGACY,
+    pack: Optional[CharacterPack] = None,
 ) -> ImagePlan:
-    """Modelo y prompt de la imagen de una escena.
+    """Modelo y prompt de la imagen de una escena según el tier (config.IMAGE_TIERS).
 
-    Sin protagonist_slug: Flux schnell con el prompt de siempre (huella idéntica a la de los videos ya pagados). Con él,
-    TODAS las escenas usan Seedream v4.5 (look coherente): edición con la referencia del personaje (`character`) si el
-    protagonista aparece en la escena, texto a imagen en el resto. `ref_sha256` = hash de ref.png si ya se calculó."""
-    if not project.protagonist_slug:
-        return ImagePlan(FLUX_MODEL, compose_scene_prompt(scene, project), video_format.flux_image_size)
-    prompt = compose_scene_prompt(scene, project, token_limit=None)
-    if PROTAGONIST_ID in scene.characters_in_scene:
+    - legacy (proyectos existentes sin tier guardado): el comportamiento anterior. Sin protagonista, Flux schnell; con él,
+      TODAS las escenas con Seedream v4.5 (edición con la referencia si el protagonista aparece, texto a imagen si no).
+    - fast: Flux schnell en todas las escenas (también en las del protagonista, sin referencia).
+    - hybrid: escenas HYBRID_DEV_SCENES (el gancho, 1 y 2) con Flux dev; el resto con schnell.
+    - character-hybrid: escenas con el protagonista -> Seedream v4.5 edit con la referencia (o, con `pack`, una pose del pack
+      local sin llamar a la API); el resto (B-roll) -> Flux schnell. Sin protagonista en el proyecto equivale a fast.
+
+    Las escenas schnell componen el prompt y la huella EXACTAMENTE como siempre (las imágenes ya pagadas no se invalidan).
+    `ref_sha256` = hash de ref.png si ya se calculó."""
+
+    def flux_plan(endpoint: str) -> ImagePlan:
+        return ImagePlan(endpoint, compose_scene_prompt(scene, project), video_format.flux_image_size)
+
+    if tier == IMAGE_TIER_FAST or (not project.protagonist_slug and tier == IMAGE_TIER_CHARACTER_HYBRID):
+        return flux_plan(FLUX_MODEL)
+    if tier == IMAGE_TIER_HYBRID:
+        return flux_plan(FLUX_DEV_MODEL if scene.scene_id in HYBRID_DEV_SCENES else FLUX_MODEL)
+    if not project.protagonist_slug:  # legacy sin protagonista
+        return flux_plan(FLUX_MODEL)
+
+    with_protagonist = PROTAGONIST_ID in scene.characters_in_scene
+    if tier == IMAGE_TIER_CHARACTER_HYBRID and not with_protagonist:
+        return flux_plan(FLUX_MODEL)
+    if with_protagonist:
         if character is None:
             raise PipelineError(f"Escena {scene.scene_id:02d}: falta el personaje '{project.protagonist_slug}' de la biblioteca.")
+        if tier == IMAGE_TIER_CHARACTER_HYBRID and pack is not None:
+            pose = pick_pack_pose(pack, scene.visual_prompt_en, scene.scene_id)
+            pose_path = pack.pose_path(pose)
+            return ImagePlan(
+                LOCAL_PACK_ENDPOINT,
+                "",
+                {"width": video_format.width, "height": video_format.height},
+                ref_image=pose_path,
+                ref_sha256=file_sha256(pose_path),
+                ref_slug=character.slug,
+                pose=pose["name"],
+            )
+        prompt = compose_scene_prompt(scene, project, token_limit=None)
         return ImagePlan(
             SEEDREAM_EDIT_ENDPOINT,
             PROTAGONIST_EDIT_PREFIX + prompt,
@@ -550,12 +640,12 @@ def plan_scene_image(
             ref_sha256=ref_sha256 or file_sha256(character.ref_image),
             ref_slug=character.slug,
         )
-    return ImagePlan(SEEDREAM_T2I_ENDPOINT, prompt, video_format.seedream_image_size)
+    return ImagePlan(SEEDREAM_T2I_ENDPOINT, compose_scene_prompt(scene, project, token_limit=None), video_format.seedream_image_size)
 
 
 def classify_recorded_plan(recorded_fp: Optional[str], plan: ImagePlan, video_format: VideoFormat) -> Optional[str]:
-    """Como classify_recorded_image pero para cualquier modelo: 'current' / 'legacy' (solo Flux vertical) / None."""
-    if plan.is_flux:
+    """Como classify_recorded_image pero para cualquier modelo: 'current' / 'legacy' (solo Flux schnell vertical) / None."""
+    if plan.endpoint == FLUX_MODEL:
         return classify_recorded_image(recorded_fp, plan.prompt, video_format)
     return "current" if recorded_fp is not None and recorded_fp == plan.fingerprint(False) else None
 
@@ -571,6 +661,19 @@ async def upload_reference(ref_image: Path) -> str:
         raise PipelineError(f"No se pudo subir la imagen de referencia {ref_image} a Fal.ai: {e}") from e
 
 
+def place_pack_image(plan: ImagePlan, image_path: Path, video_format: VideoFormat) -> Path:
+    """Escena resuelta con una pose del pack local: la imagen se recorta/escala (fit_cover) al formato. Sin API, $0."""
+    part_path = image_path.with_name(image_path.stem + ".part.png")
+    try:
+        with Image.open(plan.ref_image) as im:
+            fit_cover(im.convert("RGB"), video_format.width, video_format.height).save(part_path, "PNG")
+        os.replace(part_path, image_path)
+    finally:
+        if part_path.exists():
+            part_path.unlink()
+    return image_path
+
+
 async def generate_all_images(
     project: VideoProjectSchema,
     output_dir: Path,
@@ -579,8 +682,13 @@ async def generate_all_images(
     force: bool = False,
     overrides: Optional[ImageOverrides] = None,
     stats: Optional[RunStats] = None,
+    tier: str = IMAGE_TIER_LEGACY,
+    use_local_pack: bool = False,
 ) -> list[Path]:
-    """Generate or reuse scene images, cached per scene by content fingerprint."""
+    """Generate or reuse scene images, cached per scene by content fingerprint.
+
+    `tier` (config.IMAGE_TIERS) decide el modelo de cada escena (ver plan_scene_image); `use_local_pack` (solo
+    character-hybrid) resuelve las escenas con protagonista con poses del pack local del personaje ($0)."""
     overrides = overrides or ImageOverrides()
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -593,9 +701,13 @@ async def generate_all_images(
     # si alguna escena lo muestra (esas usan Seedream edit); un personaje borrado se avisa aquí, antes de gastar nada.
     character: Optional[Character] = None
     ref_sha256: Optional[str] = None
-    if project.protagonist_slug and any(PROTAGONIST_ID in sc.characters_in_scene for sc in project.scenes):
+    pack: Optional[CharacterPack] = None
+    uses_reference = tier in (IMAGE_TIER_LEGACY, IMAGE_TIER_CHARACTER_HYBRID)  # fast / hybrid no usan la referencia
+    if uses_reference and project.protagonist_slug and any(PROTAGONIST_ID in sc.characters_in_scene for sc in project.scenes):
         character = load_character(project.protagonist_slug)
         ref_sha256 = file_sha256(character.ref_image)
+        if use_local_pack and tier == IMAGE_TIER_CHARACTER_HYBRID:
+            pack = require_pack(character, mock_images)
 
     image_paths: list[Path] = []
     # (scene, image_path, plan, fingerprint, seed, legacy_marker)
@@ -603,16 +715,16 @@ async def generate_all_images(
     cached_count = 0
     stale_kept: list[int] = []  # retry-scene: escenas no seleccionadas con huella desactualizada que se conservan
 
+    plans = {sc.scene_id: plan_scene_image(sc, project, video_format, character, ref_sha256, tier, pack) for sc in project.scenes}
     if mock_images:
         mode_label = "MODO MOCK LOCAL"
-    elif project.protagonist_slug:
-        mode_label = "PRODUCCIÓN FAL.AI SEEDREAM v4.5"
     else:
-        mode_label = "PRODUCCIÓN FAL.AI FLUX"
+        api_models = sorted({p.short_name for p in plans.values() if not p.is_local_pack})
+        mode_label = "PRODUCCIÓN FAL.AI " + (" + ".join(api_models).upper() if api_models else "(sin llamadas: solo pack local)")
     protagonist_note = f", protagonista '{project.protagonist_slug}'" if project.protagonist_slug else ""
     console.print(
         f"[cyan]Procesando imágenes para {len(project.scenes)} escenas "
-        f"({mode_label}, formato {video_format.id} {video_format.width}x{video_format.height}{protagonist_note})...[/cyan]"
+        f"({mode_label}, tier {tier}, formato {video_format.id} {video_format.width}x{video_format.height}{protagonist_note})...[/cyan]"
     )
 
     for scene in project.scenes:
@@ -620,7 +732,7 @@ async def generate_all_images(
         legacy_marker = image_path.with_suffix(".mock")  # marcador de Fase 1, reemplazado por el manifiesto
         image_paths.append(image_path)
 
-        plan = plan_scene_image(scene, project, video_format, character, ref_sha256)
+        plan = plans[scene.scene_id]
         fp = plan.fingerprint(mock_images)
         reroll = scene.scene_id in overrides.scene_ids
         forced = force or reroll
@@ -655,7 +767,7 @@ async def generate_all_images(
                 # Migración: imagen de un workspace de Fase 1 sin entrada en el manifiesto
                 if legacy_marker.exists():
                     console.print(f"  [yellow]Escena {scene.scene_id:02d}: la imagen existente es un mock (legado); se regenerará[/yellow]")
-                elif plan.is_flux and not mock_images and image_path.stat().st_size > MIN_IMAGE_BYTES:
+                elif plan.endpoint == FLUX_MODEL and not mock_images and image_path.stat().st_size > MIN_IMAGE_BYTES:
                     manifest.record(image_path, fp)
                     is_cached = True
                     console.print(
@@ -690,6 +802,24 @@ async def generate_all_images(
     generated = 0
     failures: list[str] = []
 
+    # Escenas del pack local: se resuelven siempre en local ($0), también en modo real
+    api_pending = []
+    for item in pending:
+        scene, image_path, plan, fp, seed, legacy_marker = item
+        if not plan.is_local_pack:
+            api_pending.append(item)
+            continue
+        place_pack_image(plan, image_path, video_format)
+        manifest.record(image_path, fp)
+        if legacy_marker.exists():
+            legacy_marker.unlink()
+        generated += 1
+        if stats is not None:
+            stats.images.append(scene.scene_id)
+            stats.pack_images += 1
+        console.print(f"  [green]✓ Escena {scene.scene_id:02d}: pose '{plan.pose}' del pack local de '{plan.ref_slug}' ($0)[/green]")
+    pending = api_pending
+
     if pending and mock_images:
         for scene, image_path, plan, fp, seed, legacy_marker in pending:
             create_mock_scene_image(
@@ -722,7 +852,7 @@ async def generate_all_images(
 
         async def generate_one(plan: ImagePlan, image_path: Path, seed: Optional[int]) -> Path:
             if plan.is_flux:
-                return await generate_single_flux_image(plan.prompt, image_path, semaphore, video_format, seed=seed)
+                return await generate_single_flux_image(plan.prompt, image_path, semaphore, video_format, seed=seed, model=plan.endpoint)
             return await generate_single_seedream_image(
                 plan.prompt,
                 image_path,
@@ -751,7 +881,7 @@ async def generate_all_images(
             generated += 1
             if stats is not None:
                 stats.images.append(scene.scene_id)
-                stats.count_paid_image(plan.endpoint)
+                stats.count_paid_image(plan.endpoint, plan.cost_usd)
             console.print(f"  [green]✓ Escena {scene.scene_id:02d}: Imagen {plan.short_name} descargada[/green]")
 
     console.print(f"[bold green]✓ Imágenes: {generated} generadas, {cached_count} en caché.[/bold green]")
@@ -771,6 +901,8 @@ def generate_images_sync(
     force: bool = False,
     overrides: Optional[ImageOverrides] = None,
     stats: Optional[RunStats] = None,
+    tier: str = IMAGE_TIER_LEGACY,
+    use_local_pack: bool = False,
 ) -> list[Path]:
     """Synchronous wrapper for generate_all_images."""
     return asyncio.run(
@@ -782,5 +914,7 @@ def generate_images_sync(
             force=force,
             overrides=overrides,
             stats=stats,
+            tier=tier,
+            use_local_pack=use_local_pack,
         )
     )

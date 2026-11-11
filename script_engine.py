@@ -18,7 +18,6 @@ from config import (
     FLUX_COST_USD,
     MAX_HASHTAGS,
     PROTAGONIST_ID,
-    SCENE_WORDS_TOLERANCE,
     SEEDREAM_COST_USD,
     VideoFormat,
     get_format,
@@ -30,12 +29,17 @@ from profiles import (
     VideoProfile,
     clamp_target_minutes,
     get_profile,
-    narration_word_budget,
     profile_for_minutes,
+    profile_for_scenes,
+    scene_word_limits,
+    total_word_limits,
 )
 from prompt_templates import (
     CTA_RULE_TEMPLATE,
     PROFILE_INSTRUCTIONS,
+    STRICT_HOOK_RULE,
+    STRICT_RULE_TEMPLATE,
+    STRICT_TOTAL_RULE_TEMPLATE,
     PROTAGONIST_BLOCK_TEMPLATE,
     PROTAGONIST_FRAMING_RULES,
     SYSTEM_PROMPT_TEMPLATE,
@@ -54,9 +58,13 @@ LLM_MAX_TOKENS_PER_SCENE = 250
 LLM_MAX_TOKENS_BASE = 2000
 LLM_MAX_TOKENS_CAP = 60000
 
-# Con protagonista, al menos esta fracción de las escenas debe llevar PROTAGONIST_ID en characters_in_scene (el prompt
-# pide el 70 %): sin esa etiqueta el motor de imágenes no usa su imagen de referencia y el personaje cambia de cara.
-PROTAGONIST_MIN_SCENE_FRACTION = 0.5
+# Con protagonista, el video es B-roll explicativo sin personas y el protagonista solo sale en las ESCENAS CLAVE (el prompt pide
+# ~20 %). Debe salir en al menos una escena (sin la etiqueta PROTAGONIST_ID en characters_in_scene el motor de imágenes no usa su
+# imagen de referencia); si sale en más del 25 % (o en más de PROTAGONIST_MAX_SCENES), enforce_protagonist_scenes quita el ID de
+# las escenas sobrantes de forma determinista.
+PROTAGONIST_TARGET_FRACTION = 0.20
+PROTAGONIST_MAX_FRACTION = 0.25
+PROTAGONIST_MAX_SCENES = 24
 
 
 class CameraEffect(str, Enum):
@@ -157,8 +165,25 @@ def build_system_prompt(
         ]
     }
 
-    budget = narration_word_budget(profile)
-    tol = SCENE_WORDS_TOLERANCE
+    words_min, budget, words_max = scene_word_limits(profile)
+    if profile.target_scenes_min == profile.target_scenes_max:
+        scenes_rule = f"EXACTAMENTE {profile.target_scenes_min}"
+    else:
+        scenes_rule = f"entre {profile.target_scenes_min} y {profile.target_scenes_max}"
+        if profile.strict_scenes:
+            scenes_rule += f" (objetivo: {(profile.target_scenes_min + profile.target_scenes_max) // 2})"
+    strict_rule = hook_rule = ""
+    if profile.strict_scenes:
+        total = total_word_limits(profile)
+        total_rule = (
+            STRICT_TOTAL_RULE_TEMPLATE.format(
+                total_min=total[0], total_max=total[1], sec_min=profile.total_sec_range[0], sec_max=profile.total_sec_range[1]
+            )
+            if total is not None and profile.total_sec_range is not None
+            else ""
+        )
+        strict_rule = STRICT_RULE_TEMPLATE.format(words_min=words_min, words_max=words_max, total_rule=total_rule)
+        hook_rule = STRICT_HOOK_RULE
     cta_rule = (
         CTA_RULE_TEMPLATE.format(cta=profile.ending_call_to_action) if profile.ending_call_to_action else ""
     )
@@ -176,11 +201,12 @@ def build_system_prompt(
         schema_json=json.dumps(schema_template, indent=2, ensure_ascii=False),
         profile_upper=profile.name.upper(),
         profile_instructions=PROFILE_INSTRUCTIONS[profile.name],
-        scenes_min=profile.target_scenes_min,
-        scenes_max=profile.target_scenes_max,
-        words_min=max(budget - tol, 1),
-        words_max=budget + tol,
+        scenes_rule=scenes_rule,
+        words_min=words_min,
+        words_max=words_max,
         words_target=budget,
+        strict_rule=strict_rule,
+        hook_rule=hook_rule,
         scene_seconds=f"{profile.target_scene_duration_sec:g}",
         cta_rule=cta_rule,
         camera_effects=str(list(CAMERA_EFFECTS)),
@@ -386,8 +412,87 @@ def _mock_protagonist_script(
         hashtags=bank["hashtags"],
         protagonist_slug=protagonist.slug if protagonist is not None else "",
     )
+    if protagonist is not None:
+        # Como un guion real: el protagonista solo en las escenas clave (~20 %); el resto es B-roll sin personas
+        trim_protagonist_scenes(project, target_protagonist_scenes(len(project.scenes)))
+        ensure_no_people_without_protagonist(project)
     light_normalize_project(project, profile)  # frase de cierre del perfil, hashtags... igual que un guion real
     return project
+
+
+# Guiones mock de los shorts verticales (curiosity, micronovela): 8 escenas de 10 a 12 palabras (la última de micronovela lleva
+# el cierre del perfil, "Parte 2 en el perfil", que light_normalize_project añade) = ~30 s de audio.
+# Cada entrada: (narración, prompt visual, personajes, efecto de cámara, palabras clave).
+_MOCK_CURIOSITY_SCENES: list[tuple[str, str, list[str], str, list[str]]] = [
+    ("Tu auto pierde potencia cada vez que cargas gasolina barata sin saberlo.",
+     "Extreme close-up 3D isometric cutaway of a car engine cylinder with fuel injector spraying low quality dirty fuel",
+     [], "zoom_in_fast", ["potencia", "barata"]),
+    ("La gasolina de bajo octanaje no resiste la compresión del pistón.",
+     "Detailed 3D educational cutaway of a metallic piston moving up compressing air-fuel mixture with visible pressure waves",
+     [], "zoom_in_slow", ["compresión", "pistón"]),
+    ("Se enciende antes de tiempo y provoca explosiones diminutas llamadas cascabeleo.",
+     "Explosive premature flame front shockwave colliding violently inside the combustion chamber cylinder, studio lighting",
+     [], "zoom_out", ["explosiones", "cascabeleo"]),
+    ("Cada golpe agrieta las válvulas y desgasta los pistones poco a poco.",
+     "3D cutaway showing micro-cracks forming on a glowing red titanium engine valve under violent thermal stress",
+     [], "zoom_in_slow", ["válvulas", "pistones"]),
+    ("Además no limpia los inyectores y el carbón los tapa.",
+     "Microscopic view inside a metallic fuel injector nozzle clogged with thick black carbon deposits",
+     [], "pan_right", ["inyectores", "carbón"]),
+    ("Pero eso no es lo peor: pierdes veinte por ciento.",
+     "Futuristic automotive diagnostic hologram display showing engine power dropping sharply with red warning telemetry",
+     [], "zoom_in_fast", ["peor", "veinte"]),
+    ("El convertidor se sobrecalienta y repararlo cuesta dos mil dólares.",
+     "Cutaway of glowing orange honeycomb catalytic converter melting internally due to extreme unburnt fuel heat",
+     [], "zoom_in_fast", ["convertidor", "dólares"]),
+    ("Ahorrar unas monedas hoy te sale diez veces más caro mañana, ¿seguro?",
+     "Split visual showing small coins at a fuel pump on left vs massive engine repair tools on right",
+     [], "zoom_out", ["ahorrar", "caro"]),
+]
+
+_MOCK_MICRONOVELA_SCENES: list[tuple[str, str, list[str], str, list[str]]] = [
+    ("Encontré una carta notarial en la basura que cambió mi vida.",
+     "Dramatic close-up of hands trembling holding a crumpled stamped legal eviction notice next to a wooden trash bin",
+     ["carlos"], "zoom_in_fast", ["carta", "basura"]),
+    ("Mi hermano hipotecó la casa de mi abuela en secreto.",
+     "Dimly lit kitchen table where Carlos confronts the shadowed silhouette of a man over stacks of bank notices",
+     ["carlos"], "zoom_in_slow", ["hermano", "hipotecó"]),
+    ("La casa valía más de trescientos mil dólares y nadie lo sabía.",
+     "Charming vintage suburban two-story brick family house bathed in melancholic dusk lighting with a foreclosure sign",
+     [], "zoom_out", ["propiedad", "dólares"]),
+    ("Confronté a Elena, su abogada, y amenazó con llamar a la policía.",
+     "Luxury mahogany law office interior, Elena with sharp intense gaze pointing a pen authoritatively",
+     ["carlos", "elena"], "zoom_in_slow", ["confronté", "amenazó"]),
+    ("Pero mi abuela guardaba un segundo testamento escondido en el ático.",
+     "Antique brass key inserting into an old dusty wooden chest hidden beneath attic floorboards",
+     [], "zoom_in_fast", ["segundo", "testamento"]),
+    ("Lo firmó tres días antes de morir y nombraba al verdadero dueño.",
+     "Close-up of yellowed parchment paper showing handwritten signature in fountain pen ink",
+     [], "pan_right", ["firmado", "dueño"]),
+    ("Me quedé helado: el nombre escrito no era el de mi hermano.",
+     "Carlos standing stunned under single pendant lamp clutching the document with widened eyes",
+     ["carlos"], "zoom_in_slow", ["helado", "nombre"]),
+    ("Entonces vi quién firmó como testigo.",
+     "Carlos and Elena in high-tension cinematic standoff outside court entrance under stormy skies",
+     ["carlos", "elena"], "zoom_in_fast", ["testigo", "firmado"]),
+]
+
+
+def _pick_mock_scenes(bank: list[tuple[str, str, list[str], str, list[str]]], n: int) -> list[SceneSchema]:
+    """Las `n` escenas de un banco mock: la primera (gancho), la última (cierre) y las intermedias en ciclo (n = 1 da solo el gancho)."""
+    middle = bank[1:-1]
+    picked = [bank[0]] if n <= 1 else [bank[0]] + [middle[i % len(middle)] for i in range(n - 2)] + [bank[-1]]
+    return [
+        SceneSchema(
+            scene_id=idx,
+            narration_es=narration,
+            visual_prompt_en=visual,
+            characters_in_scene=list(chars),
+            camera_effect=camera,
+            highlight_words=list(highlights),
+        )
+        for idx, (narration, visual, chars, camera, highlights) in enumerate(picked, start=1)
+    ]
 
 
 def generate_mock_script(
@@ -412,121 +517,17 @@ def generate_mock_script(
         console.print(
             f"[yellow]  El guión de demostración del perfil '{profile.name}' no usa protagonista: se ignora '{protagonist.slug}'.[/yellow]"
         )
+    n = max((profile.target_scenes_min + profile.target_scenes_max) // 2, 1)  # 8 de 7-9; con --scenes N, exactamente N
     if profile.name == "curiosity":
-        scenes = [
-            SceneSchema(
-                scene_id=1,
-                narration_es="¿Sabías qué pasa exactamente dentro de tu motor cuando usas gasolina barata?",
-                visual_prompt_en="Extreme close-up 3D isometric cutaway of a car engine cylinder with fuel injector spraying low quality dirty fuel",
-                characters_in_scene=[],
-                camera_effect="zoom_in_fast",
-                highlight_words=["motor", "gasolina"],
-            ),
-            SceneSchema(
-                scene_id=2,
-                narration_es="La gasolina de bajo octanaje no resiste la alta compresión del pistón.",
-                visual_prompt_en="Detailed 3D educational cutaway of a metallic piston moving up compressing air-fuel mixture with visible pressure waves",
-                characters_in_scene=[],
-                camera_effect="zoom_in_slow",
-                highlight_words=["compresión", "pistón"],
-            ),
-            SceneSchema(
-                scene_id=3,
-                narration_es="Esto provoca detonaciones a destiempo conocidas como cascabeleo.",
-                visual_prompt_en="Explosive premature flame front shockwave colliding violently inside the combustion chamber cylinder, studio lighting",
-                characters_in_scene=[],
-                camera_effect="zoom_out",
-                highlight_words=["detonaciones", "cascabeleo"],
-            ),
-            SceneSchema(
-                scene_id=4,
-                narration_es="Pequeñas explosiones golpean las válvulas y destruyen las cabezas de los pistones.",
-                visual_prompt_en="3D cutaway showing micro-cracks forming on a glowing red titanium engine valve under violent thermal stress",
-                characters_in_scene=[],
-                camera_effect="zoom_in_slow",
-                highlight_words=["explosiones", "destruyen"],
-            ),
-            SceneSchema(
-                scene_id=5,
-                narration_es="Además, carece de aditivos detergentes que limpien los inyectores.",
-                visual_prompt_en="Microscopic view inside a metallic fuel injector nozzle clogged with thick black carbon deposits",
-                characters_in_scene=[],
-                camera_effect="pan_right",
-                highlight_words=["aditivos", "inyectores"],
-            ),
-            SceneSchema(
-                scene_id=6,
-                narration_es="Con los días, el carbón se acumula y bloquea el flujo perfecto de combustible.",
-                visual_prompt_en="Cross section of combustion intake manifold heavily coated in dark crusty soot and sludge",
-                characters_in_scene=[],
-                camera_effect="zoom_in_slow",
-                highlight_words=["carbón", "bloquea"],
-            ),
-            SceneSchema(
-                scene_id=7,
-                narration_es="Tu auto pierde hasta un veinte por ciento de potencia sin que lo notes.",
-                visual_prompt_en="Futuristic automotive diagnostic hologram display showing engine power dropping sharply with red warning telemetry",
-                characters_in_scene=[],
-                camera_effect="zoom_out",
-                highlight_words=["veinte", "potencia"],
-            ),
-            SceneSchema(
-                scene_id=8,
-                narration_es="El sensor de oxígeno se contamina y envía señales falsas a la computadora.",
-                visual_prompt_en="Glowing electronic lambda sensor covered in residue sending corrupted digital electrical pulses to vehicle ECU",
-                characters_in_scene=[],
-                camera_effect="zoom_in_slow",
-                highlight_words=["sensor", "computadora"],
-            ),
-            SceneSchema(
-                scene_id=9,
-                narration_es="El convertidor catalítico se sobrecalienta intentando quemar el combustible residual.",
-                visual_prompt_en="Cutaway of glowing orange honeycomb catalytic converter melting internally due to extreme unburnt fuel heat",
-                characters_in_scene=[],
-                camera_effect="zoom_in_fast",
-                highlight_words=["convertidor", "sobrecalienta"],
-            ),
-            SceneSchema(
-                scene_id=10,
-                narration_es="Una reparación que puede costar más de dos mil dólares.",
-                visual_prompt_en="Mechanic workshop workbench with shattered piston rings and damaged metal components under bright studio lights",
-                characters_in_scene=[],
-                camera_effect="zoom_in_slow",
-                highlight_words=["reparación", "dólares"],
-            ),
-            SceneSchema(
-                scene_id=11,
-                narration_es="Ahorrar un par de monedas por litro te saldrá diez veces más caro.",
-                visual_prompt_en="Split visual showing small coins at a fuel pump on left vs massive engine repair tools on right",
-                characters_in_scene=[],
-                camera_effect="pan_left",
-                highlight_words=["ahorrar", "caro"],
-            ),
-            SceneSchema(
-                scene_id=12,
-                narration_es="Revisa siempre el manual del fabricante y usa el octanaje correcto para tu motor.",
-                visual_prompt_en="Glossy car owner manual open to fuel specification page next to pristine clean engine bay",
-                characters_in_scene=[],
-                camera_effect="zoom_in_slow",
-                highlight_words=["manual", "octanaje"],
-            ),
-            SceneSchema(
-                scene_id=13,
-                narration_es="Comparte esto con quien siempre busca la gasolinera más barata.",
-                visual_prompt_en="Modern sports car engine revving smoothly with clean exhaust and pristine blue flame combustion",
-                characters_in_scene=[],
-                camera_effect="zoom_out",
-                highlight_words=["comparte", "gasolinera"],
-            ),
-        ]
-        return VideoProjectSchema(
+        bank = _MOCK_CURIOSITY_SCENES
+        project = VideoProjectSchema(
             title="Qué pasa en tu motor si usas gasolina barata",
             profile=profile.name,
             visual_style_id=style.id,
             global_visual_style=style.image_suffix,
             video_format=video_format.id,
             characters={},
-            scenes=scenes,
+            scenes=_pick_mock_scenes(bank, n),
             hook_text="Tu motor sufre en silencio",
             post_description=(
                 "Ahorrar unos centavos por litro puede costarte miles en reparaciones. "
@@ -540,88 +541,14 @@ def generate_mock_script(
             "carlos": "Carlos, a 32-year-old anxious man with messy brown hair, dark stubble, wearing an olive green jacket and grey t-shirt",
             "elena": "Elena, a 55-year-old stern elegant woman with silver-streaked bob haircut, wearing a navy blue blazer and pearl necklace",
         }
-        scenes = [
-            SceneSchema(
-                scene_id=1,
-                narration_es="Encontré una carta notarial en la basura que cambió mi vida para siempre.",
-                visual_prompt_en="Dramatic close-up of hands trembling holding a crumpled stamped legal eviction notice next to a wooden trash bin",
-                characters_in_scene=["carlos"],
-                camera_effect="zoom_in_fast",
-                highlight_words=["carta", "basura"],
-            ),
-            SceneSchema(
-                scene_id=2,
-                narration_es="Mi hermano hipotecó la casa de mi abuela en secreto para pagar una deuda.",
-                visual_prompt_en="Dimly lit kitchen table where Carlos confronts the shadowed silhouette of a man over stacks of bank notices",
-                characters_in_scene=["carlos"],
-                camera_effect="zoom_in_slow",
-                highlight_words=["hermano", "hipotecó"],
-            ),
-            SceneSchema(
-                scene_id=3,
-                narration_es="La propiedad estaba valorada en más de trescientos mil dólares.",
-                visual_prompt_en="Charming vintage suburban two-story brick family house bathed in melancholic dusk lighting with a foreclosure sign",
-                characters_in_scene=[],
-                camera_effect="zoom_out",
-                highlight_words=["propiedad", "dólares"],
-            ),
-            SceneSchema(
-                scene_id=4,
-                narration_es="Cuando confronté a Elena, su abogada, me amenazó con llamar a la policía.",
-                visual_prompt_en="Luxury mahogany law office interior, Elena with sharp intense gaze pointing a pen authoritatively",
-                characters_in_scene=["carlos", "elena"],
-                camera_effect="zoom_in_slow",
-                highlight_words=["confronté", "amenazó"],
-            ),
-            SceneSchema(
-                scene_id=5,
-                narration_es="Pero lo que ellos no sabían es que mi abuela guardaba un segundo testamento.",
-                visual_prompt_en="Antique brass key inserting into an old dusty wooden chest hidden beneath attic floorboards",
-                characters_in_scene=[],
-                camera_effect="zoom_in_fast",
-                highlight_words=["segundo", "testamento"],
-            ),
-            SceneSchema(
-                scene_id=6,
-                narration_es="Un documento firmado apenas tres días antes de su partida.",
-                visual_prompt_en="Close-up of yellowed parchment paper showing handwritten signature in fountain pen ink",
-                characters_in_scene=[],
-                camera_effect="pan_right",
-                highlight_words=["documento", "firmado"],
-            ),
-            SceneSchema(
-                scene_id=7,
-                narration_es="En esa carta revelaba quién era el verdadero dueño de todo.",
-                visual_prompt_en="Carlos standing stunned under single pendant lamp clutching the document with widened eyes",
-                characters_in_scene=["carlos"],
-                camera_effect="zoom_in_slow",
-                highlight_words=["carta", "dueño"],
-            ),
-            SceneSchema(
-                scene_id=8,
-                narration_es="Y el nombre escrito no era ni el de mi hermano ni el mío.",
-                visual_prompt_en="Dramatic dark vignette focus on a mysterious red wax seal breaking on an envelope",
-                characters_in_scene=[],
-                camera_effect="zoom_out",
-                highlight_words=["nombre", "escrito"],
-            ),
-            SceneSchema(
-                scene_id=9,
-                narration_es="Descubre la verdad oculta que destruyó a nuestra familia. Parte 2 en el perfil.",
-                visual_prompt_en="Carlos and Elena in high-tension cinematic standoff outside court entrance under stormy skies",
-                characters_in_scene=["carlos", "elena"],
-                camera_effect="zoom_in_fast",
-                highlight_words=["verdad", "perfil"],
-            ),
-        ]
-        return VideoProjectSchema(
+        project = VideoProjectSchema(
             title=topic,
             profile=profile.name,
             visual_style_id=style.id,
             global_visual_style=style.image_suffix,
             video_format=video_format.id,
             characters=characters,
-            scenes=scenes,
+            scenes=_pick_mock_scenes(_MOCK_MICRONOVELA_SCENES, n),
             hook_text="Nadie debía saberlo",
             post_description=(
                 "Un secreto familiar escondido durante años acaba de salir a la luz. "
@@ -629,6 +556,8 @@ def generate_mock_script(
             ),
             hashtags=["micronovela", "historiareal", "secretosfamiliares", "drama", "suspenso", "herencia", "chisme"],
         )
+    light_normalize_project(project, profile)  # frase de cierre del perfil, hashtags... igual que un guion real
+    return project
 
 
 def _word_tokens(text: str) -> list[str]:
@@ -713,18 +642,56 @@ def canonicalize_protagonist_ids(project: VideoProjectSchema, protagonist: Any) 
         scene.characters_in_scene = ids
 
 
+def max_protagonist_scenes(n_scenes: int) -> int:
+    """Tope de escenas con el protagonista: el 25 % (redondeado, mínimo 1) y nunca más de PROTAGONIST_MAX_SCENES."""
+    return min(PROTAGONIST_MAX_SCENES, max(1, round(n_scenes * PROTAGONIST_MAX_FRACTION)))
+
+
+def target_protagonist_scenes(n_scenes: int) -> int:
+    """Escenas clave con el protagonista que se piden (~20 %, mínimo 1, sin pasar del tope)."""
+    return min(max_protagonist_scenes(n_scenes), max(1, round(n_scenes * PROTAGONIST_TARGET_FRACTION)))
+
+
+_MAIN_CHARACTER_RE = re.compile(r"\b(?:the\s+)?main\s+character\b", re.IGNORECASE)
+
+
+def trim_protagonist_scenes(project: VideoProjectSchema, cap: int) -> int:
+    """Deja el ID del protagonista en `cap` escenas, elegidas de forma determinista y repartidas a lo largo del video (siempre
+    se conserva la primera con protagonista, que suele ser el gancho), y se lo quita al resto. En las escenas recortadas, la
+    frase "the main character" del prompt visual pasa a una figura lejana anónima (sin referencia, el generador de imágenes
+    inventaría una cara que no es la del protagonista). Devuelve cuántas escenas recortó."""
+    with_ids = [i for i, sc in enumerate(project.scenes) if PROTAGONIST_ID in sc.characters_in_scene]
+    if len(with_ids) <= cap:
+        return 0
+    if cap <= 1:
+        keep = {with_ids[0]}
+    else:
+        keep = {with_ids[round(k * (len(with_ids) - 1) / (cap - 1))] for k in range(cap)}
+    trimmed = 0
+    for i in with_ids:
+        if i in keep:
+            continue
+        scene = project.scenes[i]
+        scene.characters_in_scene = [c for c in scene.characters_in_scene if c != PROTAGONIST_ID]
+        scene.visual_prompt_en = _MAIN_CHARACTER_RE.sub("a distant anonymous figure with the face not visible", scene.visual_prompt_en)
+        trimmed += 1
+    return trimmed
+
+
 def enforce_protagonist_scenes(project: VideoProjectSchema, protagonist: Any) -> None:
-    """Unifica los IDs con que el LLM etiquetó al protagonista y exige que salga en suficientes escenas; si no, lanza
-    ValueError (el reintento le explica el problema al LLM)."""
+    """Unifica los IDs con que el LLM etiquetó al protagonista y aplica la cuota de escenas clave: al menos una escena (si no,
+    lanza ValueError y el reintento le explica el problema al LLM) y no más del 25 % (máximo PROTAGONIST_MAX_SCENES): las
+    sobrantes se recortan con trim_protagonist_scenes."""
     canonicalize_protagonist_ids(project, protagonist)
     n_total = len(project.scenes)
     n_with = sum(1 for sc in project.scenes if PROTAGONIST_ID in sc.characters_in_scene)
-    if n_total and n_with / n_total < PROTAGONIST_MIN_SCENE_FRACTION:
+    if n_total and n_with == 0:
         raise ValueError(
-            f"El protagonista '{protagonist.name}' solo está etiquetado en {n_with} de {n_total} escenas; debe aparecer "
-            f"en al menos el {PROTAGONIST_MIN_SCENE_FRACTION:.0%} (lo ideal es 70 % o más). Incluye \"{PROTAGONIST_ID}\" en "
-            "'characters_in_scene' de cada escena donde se vea y no lo definas en 'characters'"
+            f"El protagonista '{protagonist.name}' no está etiquetado en ninguna escena; debe salir en las escenas clave "
+            f"(~{target_protagonist_scenes(n_total)} de {n_total}). Incluye \"{PROTAGONIST_ID}\" en 'characters_in_scene' de esas "
+            "escenas y no lo definas en 'characters'"
         )
+    trim_protagonist_scenes(project, max_protagonist_scenes(n_total))
 
 
 # Escenas SIN el protagonista (video con protagonista): el generador de imágenes de texto a imagen inventa gente al azar si el
@@ -778,7 +745,8 @@ def normalize_project(
     format_id: str = "",
     protagonist: Optional[Any] = None,
 ) -> VideoProjectSchema:
-    """Normalize an LLM-produced project in place; raise ValueError if scene count is out of bounds.
+    """Normalize an LLM-produced project in place; raise ValueError if scene count is out of bounds (y, en los perfiles
+    strict_scenes, si las palabras por escena o totales se salen de los límites: ver validate_strict_scenes).
 
     Fija el estilo visual y el formato de video resueltos (vacíos = por defecto del perfil); es el único lugar, junto
     con el guion mock, donde se asignan visual_style_id y video_format a un guion nuevo. Con `protagonist` fija
@@ -787,8 +755,12 @@ def normalize_project(
     n_scenes = len(project.scenes)
     if not (profile.target_scenes_min <= n_scenes <= profile.target_scenes_max):
         raise ValueError(
-            f"El guión tiene {n_scenes} escenas; el perfil '{profile.name}' requiere entre "
-            f"{profile.target_scenes_min} y {profile.target_scenes_max}."
+            f"El guión tiene {n_scenes} escenas; el perfil '{profile.name}' requiere "
+            + (
+                f"EXACTAMENTE {profile.target_scenes_min}."
+                if profile.target_scenes_min == profile.target_scenes_max
+                else f"entre {profile.target_scenes_min} y {profile.target_scenes_max}."
+            )
         )
 
     style = get_style(style_id or profile.default_style_id)
@@ -804,9 +776,50 @@ def normalize_project(
         project.protagonist_slug = ""  # lo fija solo el código
 
     light_normalize_project(project, profile)
+    validate_strict_scenes(project, profile)  # tras la frase de cierre del perfil: cuenta dentro del máximo de palabras
     filter_highlight_words(project)
 
     return project
+
+
+SCENE_WORDS_HARD_SLACK = 1
+
+
+def validate_strict_scenes(project: VideoProjectSchema, profile: VideoProfile) -> None:
+    """Validación estricta de los shorts verticales (profile.strict_scenes): nº de escenas, palabras por escena (mínimo y máximo)
+    y, si el perfil lo define, palabras totales (= duración del audio entre total_sec_range). Lanza ValueError con un mensaje
+    que el reintento le devuelve al LLM. No hace nada en los demás perfiles."""
+    if not profile.strict_scenes:
+        return
+    n = len(project.scenes)
+    if not (profile.target_scenes_min <= n <= profile.target_scenes_max):
+        raise ValueError(
+            f"El guion tiene {n} escenas; este short requiere "
+            + (
+                f"EXACTAMENTE {profile.target_scenes_min}"
+                if profile.target_scenes_min == profile.target_scenes_max
+                else f"entre {profile.target_scenes_min} y {profile.target_scenes_max}"
+            )
+            + " escenas."
+        )
+    # El prompt pide scene_word_limits; aquí se tolera +-SCENE_WORDS_HARD_SLACK por escena (Gemini se pasa a menudo por una
+    # palabra). La regla que de verdad acota la duración es la de palabras TOTALES de abajo.
+    words_min, _, words_max = scene_word_limits(profile)
+    words_min, words_max = max(1, words_min - SCENE_WORDS_HARD_SLACK), words_max + SCENE_WORDS_HARD_SLACK
+    counts = [len(sc.narration_es.split()) for sc in project.scenes]
+    too_long = [f"escena {sc.scene_id} ({c} palabras)" for sc, c in zip(project.scenes, counts) if c > words_max]
+    too_short = [f"escena {sc.scene_id} ({c} palabras)" for sc, c in zip(project.scenes, counts) if c < words_min]
+    if too_long:
+        raise ValueError(f"Narración demasiado larga: máximo {words_max} palabras por escena. Acorta: {', '.join(too_long)}.")
+    if too_short:
+        raise ValueError(f"Narración demasiado corta: mínimo {words_min} palabras por escena. Amplía: {', '.join(too_short)}.")
+    total = total_word_limits(profile)
+    if total is not None and not (total[0] <= sum(counts) <= total[1]):
+        sec_min, sec_max = profile.total_sec_range  # type: ignore[misc]
+        raise ValueError(
+            f"La narración suma {sum(counts)} palabras; debe sumar entre {total[0]} y {total[1]} para que el audio dure "
+            f"entre {sec_min:g} y {sec_max:g} segundos."
+        )
 
 
 def _write_script(project: VideoProjectSchema, script_path: Path) -> None:
@@ -843,14 +856,17 @@ def script_fingerprint(
     mock_script: bool,
     protagonist_slug: str = "",
     target_minutes: Optional[float] = None,
+    target_scenes: Optional[int] = None,
 ) -> str:
-    """Huella del guion: tema + perfil + flag mock, más protagonista y duración objetivo SOLO si se indican (así las huellas
+    """Huella del guion: tema + perfil + flag mock, más protagonista, duración objetivo y nº de escenas forzado SOLO si se indican (así las huellas
     de los guiones sin ellos son idénticas a las de siempre). Ni el estilo ni el formato forman parte."""
     parts: dict[str, Any] = {"kind": "script", "topic": topic, "profile": profile_name, "mock_script": mock_script}
     if protagonist_slug:
         parts["protagonist"] = protagonist_slug
     if target_minutes is not None:
         parts["target_minutes"] = target_minutes
+    if target_scenes is not None:
+        parts["target_scenes"] = target_scenes
     return fingerprint(**parts)
 
 
@@ -1016,6 +1032,7 @@ def generate_or_load_script(
     format_id: str = "",
     protagonist: Optional[Any] = None,
     target_minutes: Optional[float] = None,
+    target_scenes: Optional[int] = None,
 ) -> VideoProjectSchema:
     """Carga el guion en caché (respetando ediciones manuales) o lo genera con Fal.ai (openrouter/router).
 
@@ -1031,6 +1048,8 @@ def generate_or_load_script(
     de las escenas (characters[PROTAGONIST_ID] y characters_in_scene). Cambiar de protagonista cambia la huella: el guion
     en caché se REGENERA (nombre, escenas y prompts estaban escritos para otro personaje; no hay forma de reutilizarlos).
     `target_minutes` (se acota a 0.5-15) ajusta el rango de escenas del perfil para durar ~esos minutos.
+    `target_scenes` (--scenes) fuerza EXACTAMENTE ese nº de escenas (tiene prioridad sobre target_minutes) y la validación
+    estricta de los shorts lo respeta.
     """
     script_path = output_dir / "script.json"
     legacy_mock_marker = output_dir / "script.mock"  # marcador de Fase 1, reemplazado por el manifiesto
@@ -1052,8 +1071,14 @@ def generate_or_load_script(
             f"  [dim]Duración objetivo ~{effective_minutes:g} min: entre {profile.target_scenes_min} y "
             f"{profile.target_scenes_max} escenas de ~{profile.target_scene_duration_sec:g} s.[/dim]"
         )
+    if target_scenes is not None:
+        try:
+            profile = profile_for_scenes(profile, target_scenes)
+        except ValueError as e:
+            raise PipelineError(str(e)) from e
+        console.print(f"  [dim]Escenas forzadas (--scenes): exactamente {profile.target_scenes_min}.[/dim]")
     protagonist_slug = protagonist.slug if protagonist is not None else ""
-    fp = script_fingerprint(topic, profile.name, mock_script, protagonist_slug, effective_minutes)
+    fp = script_fingerprint(topic, profile.name, mock_script, protagonist_slug, effective_minutes, target_scenes)
 
     if script_path.exists() and not force:
         recorded = manifest.get(script_path)
@@ -1136,7 +1161,7 @@ def generate_or_load_script(
 
     console.print(f"[cyan]Llamando a Fal.ai ({LLM_ENDPOINT} / {LLM_MODEL}) para '{topic}'...[/cyan]")
 
-    max_retries = 3
+    max_retries = 5 if profile.strict_scenes else 3  # los shorts estrictos rechazan más respuestas del LLM
     last_error: Optional[Exception] = None
     llm_cost_total = 0.0
 
